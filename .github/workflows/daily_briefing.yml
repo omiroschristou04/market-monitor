@@ -1,0 +1,72 @@
+# Market Monitor — automated daily briefing.
+#
+# Runs the full pipeline in GitHub's cloud so nothing depends on a local
+# machine being switched on. The schedule is UTC (GitHub Actions has no
+# timezone setting), so 05:30 UTC is used year-round:
+#     winter (GMT):  05:30 UTC = 06:30 UK
+#     summer (BST):  05:30 UTC = 06:30 BST -> arrives 05:30 UK local
+# A single cron keeps the run at or before 06:30 UK all year.
+
+name: Daily Market Briefing
+
+on:
+  schedule:
+    # 05:30 UTC, Monday-Friday (06:30 UK time).
+    - cron: '30 5 * * 1-5'
+  # Lets you run the pipeline on demand from the Actions tab.
+  workflow_dispatch:
+
+# The job commits the refreshed report back to the repo, so it needs write
+# access to repository contents via the automatic GITHUB_TOKEN.
+permissions:
+  contents: write
+
+# Never let a manual run and a scheduled run push at the same time.
+concurrency:
+  group: daily-briefing
+  cancel-in-progress: false
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    # Report dates and "as of" timestamps follow UK time, not UTC.
+    env:
+      TZ: Europe/London
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        # persist-credentials (default true) leaves a GITHUB_TOKEN-backed
+        # credential in place, so the push step below needs no extra auth.
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the pipeline
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          GITHUB_PAGES_URL: ${{ secrets.GITHUB_PAGES_URL }}
+        run: python run.py
+
+      - name: Commit and push the updated report
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add docs
+          if git diff --staged --quiet; then
+            echo "docs/ is unchanged — nothing to publish."
+          else
+            git commit -m "Daily briefing - $(date +'%Y-%m-%d')"
+            git push
+            echo "Pushed updated docs/ — GitHub Pages will rebuild."
+          fi

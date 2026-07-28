@@ -1,6 +1,7 @@
 """Market Monitor — master run script.
 
 Runs the full pipeline end to end:
+    0. load configuration (.env locally, environment variables in CI)
     1. ensure the database table exists
     2. fetch the latest data for every configured ticker
     3. persist the snapshot to SQLite
@@ -9,6 +10,16 @@ Runs the full pipeline end to end:
     6. copy today's report to the Desktop (clearing older copies)
     7. publish the report to GitHub Pages (copy to docs/ + git push)
     8. email a clean summary briefing (with a link to the full report) via Gmail SMTP
+
+Configuration comes from two interchangeable places, so the same script runs
+on a laptop and in GitHub Actions:
+
+    * locally  — a ``.env`` file next to this script (see ``.env.example``)
+    * in CI    — real environment variables, populated from GitHub Secrets by
+                 ``.github/workflows/daily_briefing.yml``
+
+Values already present in the environment always win; ``.env`` only fills in
+what is missing, so a GitHub Secret is never overwritten by a stale local file.
 
 Usage:
     python run.py
@@ -20,6 +31,11 @@ import shutil
 import sys
 import time
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # python-dotenv is listed in requirements.txt
+    load_dotenv = None
+
 from src.email_report import send_email
 from src.fetch import fetch_all_tickers
 from src.news import fetch_headlines
@@ -27,8 +43,71 @@ from src.publish import publish_to_github
 from src.report import generate_report
 from src.store import create_table, insert_daily_data
 
-# Where the finished report should land each morning.
+# Where the finished report should land each morning. Absent on CI runners,
+# in which case the Desktop copy is skipped.
 DESKTOP_DIR = r"C:\Users\ALEX\Desktop"
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+
+# Settings the pipeline reads, and whether a missing value is worth warning
+# about. GITHUB_PAGES_URL is optional — without it the email links to a local
+# file:// path instead of the published site.
+SETTINGS = [
+    ("GMAIL_ADDRESS", True, "sender address for the briefing email"),
+    ("GMAIL_APP_PASSWORD", True, "16-character Gmail App Password"),
+    ("EMAIL_RECIPIENT", False, "recipient (defaults to GMAIL_ADDRESS)"),
+    ("GITHUB_PAGES_URL", False, "public report URL used by the email button"),
+]
+
+# Values never printed in full — only whether they are set.
+SECRET_SETTINGS = {"GMAIL_APP_PASSWORD"}
+
+
+def _mask(name, value):
+    """Render a setting for the console without leaking secrets."""
+    if name in SECRET_SETTINGS:
+        return f"set ({len(value)} chars)"
+    return value
+
+
+def load_environment(env_path=ENV_PATH):
+    """Load configuration from ``.env`` when present, else the environment.
+
+    On this PC the values come from ``.env``. Under GitHub Actions there is no
+    ``.env`` file — the workflow injects GMAIL_ADDRESS, GMAIL_APP_PASSWORD,
+    EMAIL_RECIPIENT and GITHUB_PAGES_URL as environment variables from GitHub
+    Secrets, and every setting is read with ``os.environ.get`` either way.
+
+    Prints a short summary of what was found and returns the resolved settings
+    as a dict. Missing values are never fatal: email and publishing each soft
+    skip on their own.
+    """
+    if os.path.isfile(env_path):
+        if load_dotenv is not None:
+            # override=False: a real environment variable (a GitHub Secret)
+            # always beats the file.
+            load_dotenv(env_path, override=False)
+            print(f"      Loaded settings from {os.path.basename(env_path)}.")
+        else:
+            print("      ! python-dotenv is not installed; reading environment "
+                  "variables only.")
+    else:
+        print("      No .env file — reading settings from environment "
+              "variables.")
+
+    resolved = {}
+    for name, required, description in SETTINGS:
+        value = os.environ.get(name, "").strip()
+        resolved[name] = value
+        if value:
+            print(f"      {name}: {_mask(name, value)}")
+        elif required:
+            print(f"      ! {name} is not set ({description}).")
+        else:
+            print(f"      - {name} not set ({description}); using default.")
+
+    return resolved
 
 
 def copy_to_desktop(report_path, desktop_dir=DESKTOP_DIR):
@@ -66,6 +145,10 @@ def main():
     print("=" * 60)
     print(" MARKET MONITOR")
     print("=" * 60)
+
+    # 0. Configuration — .env locally, environment variables in GitHub Actions.
+    print("\nLoading configuration...")
+    load_environment()
 
     # 1. Database
     print("\n[1/8] Preparing database...")
