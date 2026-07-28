@@ -153,7 +153,7 @@ Copy `.env.example` to `.env` and fill in your values:
 GMAIL_ADDRESS=youraddress@gmail.com
 GMAIL_APP_PASSWORD=your16charapppassword   # Gmail App Password, spaces removed
 EMAIL_RECIPIENT=recipient@example.com      # optional, defaults to sender
-GITHUB_PAGES_URL=https://yourusername.github.io/market-monitor/
+PAGES_URL=https://yourusername.github.io/market-monitor/
 ```
 
 Gmail requires an [App Password](https://myaccount.google.com/apppasswords) with 2-Step Verification enabled — a normal password will not authenticate. Both email and GitHub Pages publishing are optional: leave `.env` unconfigured and the pipeline simply skips those stages.

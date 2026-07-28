@@ -55,7 +55,7 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
-          GITHUB_PAGES_URL: ${{ secrets.GITHUB_PAGES_URL }}
+          PAGES_URL: ${{ secrets.PAGES_URL }}
         run: python run.py
 
       - name: Commit and push the updated report

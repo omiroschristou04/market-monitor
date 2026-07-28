@@ -102,11 +102,11 @@ def _report_date(report_path):
 def _report_url(report_path):
     """URL the "Open Full Report" button points at.
 
-    Prefers the public GitHub Pages site (``GITHUB_PAGES_URL`` in ``.env``) so
+    Prefers the public GitHub Pages site (``PAGES_URL`` in ``.env``) so
     the report opens on any device. Falls back to a local ``file://`` URL that
     opens the report from this PC's Desktop when the Pages URL is not set.
     """
-    pages_url = os.environ.get("GITHUB_PAGES_URL", "").strip()
+    pages_url = os.environ.get("PAGES_URL", "").strip()
     if pages_url:
         return pages_url
 

@@ -51,13 +51,13 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 
 # Settings the pipeline reads, and whether a missing value is worth warning
-# about. GITHUB_PAGES_URL is optional — without it the email links to a local
+# about. PAGES_URL is optional — without it the email links to a local
 # file:// path instead of the published site.
 SETTINGS = [
     ("GMAIL_ADDRESS", True, "sender address for the briefing email"),
     ("GMAIL_APP_PASSWORD", True, "16-character Gmail App Password"),
     ("EMAIL_RECIPIENT", False, "recipient (defaults to GMAIL_ADDRESS)"),
-    ("GITHUB_PAGES_URL", False, "public report URL used by the email button"),
+    ("PAGES_URL", False, "public report URL used by the email button"),
 ]
 
 # Values never printed in full — only whether they are set.
@@ -76,7 +76,7 @@ def load_environment(env_path=ENV_PATH):
 
     On this PC the values come from ``.env``. Under GitHub Actions there is no
     ``.env`` file — the workflow injects GMAIL_ADDRESS, GMAIL_APP_PASSWORD,
-    EMAIL_RECIPIENT and GITHUB_PAGES_URL as environment variables from GitHub
+    EMAIL_RECIPIENT and PAGES_URL as environment variables from GitHub
     Secrets, and every setting is read with ``os.environ.get`` either way.
 
     Prints a short summary of what was found and returns the resolved settings

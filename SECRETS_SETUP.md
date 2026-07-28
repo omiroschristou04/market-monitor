@@ -38,7 +38,7 @@ GitHub will never show them again. They are also masked in workflow logs.
 | `GMAIL_ADDRESS` | Yes | The Gmail address the briefing is sent **from**, e.g. `youraddress@gmail.com` |
 | `GMAIL_APP_PASSWORD` | Yes | Your 16-character Gmail **App Password**, spaces removed |
 | `EMAIL_RECIPIENT` | Optional | Who receives the briefing. Omit to send to yourself (`GMAIL_ADDRESS`) |
-| `GITHUB_PAGES_URL` | Optional | Public report URL, e.g. `https://omiroschristou04.github.io/market-monitor/` |
+| `PAGES_URL` | Optional | Public report URL, e.g. `https://omiroschristou04.github.io/market-monitor/` |
 
 If a required secret is missing the pipeline does **not** crash — it still
 fetches data and publishes the report, and simply skips the email with a
@@ -63,7 +63,7 @@ You already have this in your local `.env` file — open it and copy the
 
 **`EMAIL_RECIPIENT`** — any address you want the briefing delivered to.
 
-**`GITHUB_PAGES_URL`** — the address GitHub Pages serves your report at. Find
+**`PAGES_URL`** — the address GitHub Pages serves your report at. Find
 it under **Settings → Pages**; it is shown as *"Your site is live at …"*. It
 follows the pattern `https://<your-username>.github.io/<repo-name>/`. This is
 the link behind the **Open Full Report** button in the email, so without it
