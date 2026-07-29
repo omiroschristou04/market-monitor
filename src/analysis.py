@@ -9,8 +9,19 @@ Every function is defensive about missing values (None) so a single failed
 ticker never breaks the briefing. Functions return semantic "tone" strings
 ("pos" / "neg" / "caution" / "neutral") rather than colours, so the report
 layer keeps full control of the visual language.
+
+Two rules hold throughout this module:
+
+    1. The regime label is a *weighted score* across five components (VIX
+       level, 2s10s curve, equity direction, gold, dollar). No single
+       component — and no single index — can decide it on its own.
+    2. Narrative text is derived from values, never from the label. If a
+       sentence claims a direction, the number behind it must agree. The
+       ``consistency_check`` at the bottom of this file enforces that and
+       reports violations to the console.
 """
 
+import re
 from statistics import mean
 
 
@@ -49,42 +60,252 @@ def _pct(value, dp=2):
     return f"{value:+.{dp}f}%" if value is not None else "n/a"
 
 
+def _clip(value, lo=-1.0, hi=1.0):
+    return max(lo, min(hi, value))
+
+
+def _dir(value, flat=None):
+    """Direction of a daily % move with a dead-band: -1 / 0 / +1.
+
+    Unlike ``_sign`` this treats anything inside +/- ``flat`` as genuinely
+    flat, so a -0.03% average never reads as "lower".
+    """
+    if value is None:
+        return 0
+    band = FLAT_PCT if flat is None else flat
+    if value > band:
+        return 1
+    if value < -band:
+        return -1
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Regime scoring — tunables
+# --------------------------------------------------------------------------- #
+# A daily move smaller than this is flat, not directional.
+FLAT_PCT = 0.10
+
+# No single index may push the equity component by more than this, so one
+# outlier (a -4% Nikkei while Europe rallies) cannot flip the whole regime.
+EQ_WINSOR_PCT = 1.50
+
+# Moves that saturate a component at full -1 / +1.
+EQ_FULL_PCT = 0.75
+GOLD_FULL_PCT = 1.50
+
+# Relative component weights. Renormalised over whichever components have
+# data, so a missing ticker rescales the rest instead of skewing the score.
+REGIME_WEIGHTS = {
+    "vix":      0.30,
+    "curve":    0.20,
+    "equities": 0.25,
+    "gold":     0.15,
+    "dollar":   0.10,
+}
+
+# Score thresholds. Deliberately symmetric — the old gates required VIX < 18
+# for Risk-On but only VIX >= 20 for Risk-Off, which made the 18-20 band
+# structurally incapable of printing Risk-On.
+RISK_ON_AT = 0.30
+RISK_OFF_AT = -0.30
+
+FX_PAIRS = ("EURUSD=X", "GBPUSD=X", "JPY=X")
+
+
+def _equity_stats(rows):
+    """Breadth and central-tendency stats for the equity complex.
+
+    ``mean`` is the plain average shown in the report. ``winsor_mean`` caps
+    each index at +/- EQ_WINSOR_PCT and is what feeds the regime score, so a
+    single outsized decliner cannot dominate the classification.
+    """
+    eqs = [r for r in _equities(rows) if r.get("change_pct") is not None]
+    if not eqs:
+        return None
+    changes = [r["change_pct"] for r in eqs]
+    up = sum(1 for c in changes if c > FLAT_PCT)
+    down = sum(1 for c in changes if c < -FLAT_PCT)
+    return {
+        "rows": eqs,
+        "changes": changes,
+        "n": len(changes),
+        "mean": mean(changes),
+        "winsor_mean": mean(_clip(c, -EQ_WINSOR_PCT, EQ_WINSOR_PCT)
+                            for c in changes),
+        "up": up,
+        "down": down,
+        "flat": len(changes) - up - down,
+        "breadth": (up - down) / len(changes),
+        "best": max(eqs, key=lambda r: r["change_pct"]),
+        "worst": min(eqs, key=lambda r: r["change_pct"]),
+    }
+
+
+# Each component scores to [-1, +1] where POSITIVE means risk-on.
+def _vix_component(vix):
+    """12 or below -> +1; 18 -> neutral; 30 or above -> -1."""
+    if vix is None:
+        return None
+    if vix <= 12:
+        return 1.0
+    if vix <= 18:
+        return (18.0 - vix) / 6.0
+    if vix <= 30:
+        return -(vix - 18.0) / 12.0
+    return -1.0
+
+
+def _curve_component(spread_bps):
+    """+100bps or steeper -> +1; flat -> 0; -50bps or deeper -> -1."""
+    if spread_bps is None:
+        return None
+    if spread_bps >= 0:
+        return _clip(spread_bps / 100.0)
+    return _clip(spread_bps / 50.0)
+
+
+def _equity_component(stats):
+    """Winsorised average blended with breadth (share of indices higher)."""
+    if stats is None:
+        return None
+    return _clip(0.6 * (stats["winsor_mean"] / EQ_FULL_PCT)
+                 + 0.4 * stats["breadth"])
+
+
+def _gold_component(gold_chg):
+    """Gold bid = haven demand = risk-negative, so the sign is inverted."""
+    if gold_chg is None:
+        return None
+    return _clip(-gold_chg / GOLD_FULL_PCT)
+
+
+def _dollar_component(rows, usd_raw):
+    """A firmer dollar is a mild risk headwind. None if no FX data at all."""
+    if not any(_field(rows, t, "change_pct") is not None for t in FX_PAIRS):
+        return None
+    return _clip(-usd_raw / 3.0)
+
+
+def _equity_phrase(stats):
+    """Describe the equity tape from breadth AND the average together.
+
+    When the two disagree — four indices higher but one outlier dragging the
+    mean negative — neither "extend gains" nor "trade lower" is honest, so the
+    phrase says mixed and names the index responsible. Returns
+    (phrase, shape) where shape is 'up' / 'down' / 'flat' / 'mixed'.
+    """
+    if stats is None:
+        return "equity direction is unclear", "flat"
+    avg = stats["mean"]
+    avg_dir = _dir(avg)
+    breadth_dir = _dir(stats["breadth"], 0.0)
+    if avg_dir != 0 and breadth_dir != 0 and avg_dir != breadth_dir:
+        outlier = stats["worst"] if avg_dir < 0 else stats["best"]
+        return (f"equities are mixed ({stats['up']} of {stats['n']} higher, but "
+                f"{outlier['name']} {_pct(outlier['change_pct'])} pulls the "
+                f"average to {_pct(avg)})"), "mixed"
+    if avg_dir > 0:
+        return f"equities extend gains (avg {_pct(avg)})", "up"
+    if avg_dir < 0:
+        return f"equities trade lower (avg {_pct(avg)})", "down"
+    return f"equities trade broadly flat (avg {_pct(avg)})", "flat"
+
+
+def _join_phrases(items):
+    """'a', 'a and b', 'a, b and c' from component text fragments."""
+    texts = [c["text"] for c in items]
+    if len(texts) == 1:
+        return texts[0]
+    return ", ".join(texts[:-1]) + " and " + texts[-1]
+
+
 # --------------------------------------------------------------------------- #
 # Market regime
 # --------------------------------------------------------------------------- #
 def market_regime(rows):
     """Classify the environment: Risk-On / Risk-Off / Transitional / Stress.
 
-    Uses VIX level, average equity direction, and the gold/bond reaction.
-    Returns {label, tone, detail}.
+    Five components — VIX level, the 2s10s curve, equity direction, gold and
+    the dollar — are each scored to [-1, +1] (positive = risk-on) and combined
+    with the weights in REGIME_WEIGHTS, renormalised over whichever components
+    actually have data. The label then falls out of symmetric thresholds on
+    that single score, so no individual signal (and, thanks to winsorising, no
+    individual index) can carry the classification on its own.
+
+    Returns {label, tone, detail, score, components}, where ``components`` is
+    a list of {key, label, weight, score, contribution, text}. ``detail`` is
+    built from the components that actually moved the score — it is never a
+    canned string attached to the label.
     """
     vix = _field(rows, "^VIX", "price")
-    avg_eq = _avg([r.get("change_pct") for r in _equities(rows)])
+    curve = yield_curve(rows)
+    stats = _equity_stats(rows)
     gold_chg = _field(rows, "GC=F", "change_pct")
-    yield_chg = _field(rows, "^TNX", "change_pct")  # 10Y yield % change
+    usd_raw, usd_label = _usd_read(rows)
 
-    # Defaults if we somehow have no data.
-    if avg_eq is None and vix is None:
+    specs = [
+        ("vix", "VIX", _vix_component(vix),
+         f"VIX {vix:.1f}" if vix is not None else "VIX n/a"),
+        ("curve", "2s10s", _curve_component(curve["spread_bps"]),
+         f"2s10s {curve['spread_bps']:+.0f}bps"
+         if curve["spread_bps"] is not None else "curve n/a"),
+        ("equities", "Equities", _equity_component(stats),
+         f"{stats['up']} of {stats['n']} indices higher (avg {_pct(stats['mean'])})"
+         if stats else "equity data n/a"),
+        ("gold", "Gold", _gold_component(gold_chg),
+         f"gold {_pct(gold_chg)}" if gold_chg is not None else "gold n/a"),
+        ("dollar", "Dollar", _dollar_component(rows, usd_raw),
+         f"dollar {usd_label}"),
+    ]
+    available = [s for s in specs if s[2] is not None]
+
+    # Need at least the volatility or the equity leg to say anything useful.
+    if not available or (vix is None and stats is None):
         return {"label": "Transitional", "tone": "caution",
-                "detail": "Insufficient data to classify the regime."}
+                "detail": "Insufficient data to classify the regime.",
+                "score": None, "components": []}
 
-    # Stress dominates everything else.
-    if vix is not None and vix >= 30:
-        return {"label": "Stress", "tone": "neg",
-                "detail": "VIX above 30 signals acute market stress."}
+    total_weight = sum(REGIME_WEIGHTS[key] for key, _, _, _ in available)
+    components, score = [], 0.0
+    for key, label, component_score, text in available:
+        weight = REGIME_WEIGHTS[key] / total_weight
+        contribution = weight * component_score
+        score += contribution
+        components.append({"key": key, "label": label, "weight": weight,
+                           "score": component_score,
+                           "contribution": contribution, "text": text})
 
-    eq = avg_eq if avg_eq is not None else 0.0
-    gold_up = _sign(gold_chg) > 0
-    yields_down = _sign(yield_chg) < 0  # bond prices up
+    # Stress still overrides, but now needs either an outright VIX spike or a
+    # high VIX confirmed by a broadly negative cross-asset score.
+    if vix is not None and (vix >= 30 or (vix >= 25 and score <= -0.50)):
+        label, tone = "Stress", "neg"
+    elif score >= RISK_ON_AT:
+        label, tone = "Risk-On", "pos"
+    elif score <= RISK_OFF_AT:
+        label, tone = "Risk-Off", "neg"
+    else:
+        label, tone = "Transitional", "caution"
 
-    if eq < 0 and ((vix is not None and vix >= 20) or gold_up or yields_down):
-        return {"label": "Risk-Off", "tone": "neg",
-                "detail": "Equities soft with defensive bid in bonds/gold."}
-    if eq > 0 and (vix is None or vix < 18):
-        return {"label": "Risk-On", "tone": "pos",
-                "detail": "Equities firm and volatility contained."}
-    return {"label": "Transitional", "tone": "caution",
-            "detail": "Mixed cross-asset signals; no clear directional bias."}
+    # Detail is assembled from the components that moved the number.
+    supports = sorted((c for c in components if c["contribution"] > 0.02),
+                      key=lambda c: -c["contribution"])
+    drags = sorted((c for c in components if c["contribution"] < -0.02),
+                   key=lambda c: c["contribution"])
+
+    parts = [f"cross-asset score {score:+.2f}"]
+    if supports:
+        verb = "leans" if len(supports) == 1 else "lean"
+        parts.append(f"{_join_phrases(supports)} {verb} risk-on")
+    if drags:
+        verb = "leans" if len(drags) == 1 else "lean"
+        parts.append(f"{_join_phrases(drags)} {verb} risk-off")
+    if not supports and not drags:
+        parts.append("every component reads neutral")
+    detail = "; ".join(parts).capitalize() + "."
+
+    return {"label": label, "tone": tone, "detail": detail,
+            "score": score, "components": components}
 
 
 # --------------------------------------------------------------------------- #
@@ -154,35 +375,51 @@ def drawdowns(rows):
 # --------------------------------------------------------------------------- #
 def correlation_note(rows):
     """One plain-English sentence on today's equity / bond / gold relationship."""
-    avg_eq = _avg([r.get("change_pct") for r in _equities(rows)])
+    stats = _equity_stats(rows)
+    avg_eq = stats["mean"] if stats else None
     yield_chg = _field(rows, "^TNX", "change_pct")
     gold_chg = _field(rows, "GC=F", "change_pct")
 
-    eq_dir = _sign(avg_eq)
-    bond_dir = -_sign(yield_chg)  # yields up => bond prices down
-    gold_dir = _sign(gold_chg)
+    # Dead-banded so a flat tape is not described as a rally or a selloff.
+    eq_dir = _dir(avg_eq)
+    bond_dir = -_dir(yield_chg, 0.05)  # yields up => bond prices down
+    gold_dir = _dir(gold_chg)
+
+    eq_val = f"average index move {_pct(avg_eq)}" if avg_eq is not None else "equities n/a"
+    y_val = f"10Y yield {_pct(yield_chg)}" if yield_chg is not None else "10Y n/a"
 
     if eq_dir == 0 and bond_dir == 0:
-        base = "Equities and bonds are little changed, offering few cross-asset signals today."
+        base = (f"Equities and bonds are little changed ({eq_val}, {y_val}), "
+                f"offering few cross-asset signals today.")
     elif eq_dir > 0 and bond_dir > 0:
-        base = ("Equities and bonds are rallying together as yields ease — a "
-                "liquidity-friendly backdrop supportive of risk.")
+        base = (f"Equities and bonds are rallying together as yields ease "
+                f"({eq_val}, {y_val}) — a liquidity-friendly backdrop supportive of risk.")
     elif eq_dir > 0 and bond_dir < 0:
-        base = ("Equities climb while bonds sell off (yields higher) — a classic "
-                "reflationary, risk-on configuration.")
+        base = (f"Equities climb while bonds sell off ({eq_val}, {y_val}) — a classic "
+                f"reflationary, risk-on configuration.")
     elif eq_dir < 0 and bond_dir > 0:
-        base = ("Equities fall as bonds catch a bid — textbook risk-off, "
-                "flight-to-quality positioning.")
+        if stats and stats["breadth"] > 0:
+            # Only the average is negative; most indices actually rose.
+            base = (f"Bonds catch a bid while equity breadth stays positive "
+                    f"({stats['up']} of {stats['n']} indices higher, {eq_val}, "
+                    f"{y_val}) — a rates-led move rather than a broad flight to quality.")
+        else:
+            base = (f"Equities fall as bonds catch a bid ({eq_val}, {y_val}) — textbook "
+                    f"risk-off, flight-to-quality positioning.")
     elif eq_dir < 0 and bond_dir < 0:
-        base = ("Both equities and bonds are under pressure — rising yields into a "
-                "stock selloff point to a rates-driven, correlation-up regime.")
+        base = (f"Both equities and bonds are under pressure ({eq_val}, {y_val}) — "
+                f"rising yields into a stock selloff point to a rates-driven, "
+                f"correlation-up regime.")
     else:
-        base = "Cross-asset moves are mixed, with no single dominant theme."
+        base = (f"Cross-asset moves are mixed ({eq_val}, {y_val}), with no single "
+                f"dominant theme.")
 
     if gold_dir > 0:
-        base += " Gold is firmer, consistent with hedging demand."
+        base += f" Gold is firmer ({_pct(gold_chg)}), consistent with hedging demand."
     elif gold_dir < 0:
-        base += " Gold is softer, suggesting limited safe-haven demand."
+        base += f" Gold is softer ({_pct(gold_chg)}), suggesting limited safe-haven demand."
+    elif gold_chg is not None:
+        base += f" Gold is unchanged ({_pct(gold_chg)}), with no haven signal either way."
     return base
 
 
@@ -233,7 +470,8 @@ def _usd_read(rows):
     eur = _field(rows, "EURUSD=X", "change_pct")
     gbp = _field(rows, "GBPUSD=X", "change_pct")
     jpy = _field(rows, "JPY=X", "change_pct")
-    score = -_sign(eur) - _sign(gbp) + _sign(jpy)
+    # Dead-band of 0.05% so FX noise does not count as a directional move.
+    score = -_dir(eur, 0.05) - _dir(gbp, 0.05) + _dir(jpy, 0.05)
     if score >= 2:
         return score, "broadly firmer"
     if score <= -2:
@@ -253,43 +491,79 @@ def morning_briefing(rows):
     regime = market_regime(rows)
     curve = yield_curve(rows)
     vix = _field(rows, "^VIX", "price")
-    avg_eq = _avg([r.get("change_pct") for r in _equities(rows)])
-    eqs = _equities(rows)
-
-    # Best / worst equity index on the day.
-    rated = [e for e in eqs if e.get("change_pct") is not None]
-    best = max(rated, key=lambda e: e["change_pct"]) if rated else None
-    worst = min(rated, key=lambda e: e["change_pct"]) if rated else None
+    stats = _equity_stats(rows)
+    avg_eq = stats["mean"] if stats else None
+    best = stats["best"] if stats else None
+    worst = stats["worst"] if stats else None
 
     gold_chg = _field(rows, "GC=F", "change_pct")
     oil_chg = _field(rows, "CL=F", "change_pct")
     sp = _field(rows, "^GSPC", "price")
+    kl = key_levels(rows)
     usd_score, usd_label = _usd_read(rows)
+    score = regime.get("score")
 
-    # --- Opening paragraph (2-3 sentences) --------------------------------- #
-    if regime["label"] == "Risk-On":
-        lead = "Risk appetite is firm this morning"
-    elif regime["label"] == "Risk-Off":
-        lead = "Markets open on the defensive"
-    elif regime["label"] == "Stress":
+    # --- Opening paragraph (3 sentences) ----------------------------------- #
+    # The lead comes from the weighted score (itself derived from the day's
+    # numbers), NOT from the regime label — and it carries the magnitude, so a
+    # -0.03% tape can never read as "on the defensive".
+    if regime["label"] == "Stress":
         lead = "Markets are under visible stress"
-    else:
+    elif score is None:
+        lead = "Markets open with an incomplete data picture"
+    elif score >= RISK_ON_AT:
+        lead = "Risk appetite is firm this morning"
+    elif score >= 0.10:
+        lead = "Markets open with a mild constructive tilt"
+    elif score > -0.10:
         lead = "Markets open in a holding pattern"
-
-    eq_phrase = ("equities extend gains" if (avg_eq or 0) > 0
-                 else "equities trade lower" if (avg_eq or 0) < 0
-                 else "equities trade broadly flat")
-    vol_phrase = (f"the VIX at {vix:.1f}" if vix is not None else "volatility data thin")
-
-    s1 = f"{lead} as {eq_phrase} and {vol_phrase} frames the tape."
-    if sp is not None:
-        s2 = (f"The S&P 500 sits at {sp:,.0f}, with breadth across global indices "
-              f"{'constructive' if (avg_eq or 0) >= 0 else 'soft'}.")
+    elif score > RISK_OFF_AT:
+        lead = "Markets open with a mild defensive tilt"
     else:
-        s2 = "Global index breadth is the key tell into the session."
-    s3 = (f"The dollar is {usd_label} and the curve reads "
-          f"{curve['label'].lower()}, leaving cross-asset signals "
-          f"{'supportive' if regime['tone'] == 'pos' else 'cautious' if regime['tone'] == 'caution' else 'risk-negative'}.")
+        lead = "Markets open on the defensive"
+
+    eq_phrase, eq_shape = _equity_phrase(stats)
+
+    if vix is None:
+        vol_phrase = "volatility data is thin"
+    else:
+        vol_word = ("subdued" if vix < 20 else
+                    "above-average" if vix < 30 else "elevated")
+        vol_phrase = f"a {vol_word} VIX at {vix:.1f}"
+    s1 = f"{lead} as {eq_phrase} and {vol_phrase} frames the tape."
+
+    # Sentence 2 states price and the 52-week high as separate, labelled
+    # numbers so the two can never be read as the same level.
+    if kl:
+        s2 = (f"The S&P 500 trades at {kl['price']:,.0f}, "
+              f"{abs(kl['pct_from_high']):.1f}% below its 52-week closing high "
+              f"of {kl['high']:,.0f}")
+    elif sp is not None:
+        s2 = f"The S&P 500 trades at {sp:,.0f}"
+    else:
+        s2 = "S&P 500 pricing is unavailable"
+    if stats and eq_shape == "mixed":
+        # Breadth was already quoted in eq_phrase; give the dispersion instead.
+        s2 += (f", with index moves spanning {_pct(stats['worst']['change_pct'])} "
+               f"({stats['worst']['name']}) to {_pct(stats['best']['change_pct'])} "
+               f"({stats['best']['name']}).")
+    elif stats:
+        s2 += (f", with {stats['up']} of {stats['n']} tracked indices higher "
+               f"on the day.")
+    else:
+        s2 += "."
+
+    curve_phrase = (f"the 2s10s curve reads {curve['label'].lower()} at "
+                    f"{curve['spread_bps']:+.0f}bps"
+                    if curve["spread_bps"] is not None
+                    else "curve data is unavailable")
+    if score is None:
+        tail = "leaving the cross-asset picture unresolved"
+    else:
+        picture = ("supportive" if score >= RISK_ON_AT else
+                   "risk-negative" if score <= RISK_OFF_AT else "mixed")
+        tail = f"leaving the cross-asset picture {picture} (score {score:+.2f})"
+    s3 = f"The dollar is {usd_label} and {curve_phrase}, {tail}."
     paragraph = " ".join([s1, s2, s3])
 
     # --- Bullets ----------------------------------------------------------- #
@@ -300,15 +574,19 @@ def morning_briefing(rows):
                     "text": f"{regime['label']} — {regime['detail']}",
                     "tone": regime["tone"]})
 
-    # 2. Equities
+    # 2. Equities — breadth stated alongside the average so a single outlier
+    #    index is visible rather than silently driving the read.
     if best and worst:
         if best["ticker"] == worst["ticker"]:
             eq_text = f"{best['name']} {_pct(best['change_pct'])} on the day."
         else:
             eq_text = (f"{best['name']} leads ({_pct(best['change_pct'])}); "
                        f"{worst['name']} lags ({_pct(worst['change_pct'])}); "
-                       f"average index move {_pct(avg_eq)}.")
-        eq_tone = "pos" if (avg_eq or 0) > 0 else "neg" if (avg_eq or 0) < 0 else "neutral"
+                       f"average index move {_pct(avg_eq)} with "
+                       f"{stats['up']} of {stats['n']} higher.")
+        # A tape whose breadth and average disagree is neutral, not directional.
+        eq_dir = 0 if eq_shape == "mixed" else _dir(avg_eq)
+        eq_tone = "pos" if eq_dir > 0 else "neg" if eq_dir < 0 else "neutral"
     else:
         eq_text, eq_tone = "Equity data unavailable.", "neutral"
     bullets.append({"label": "Equities", "text": eq_text, "tone": eq_tone})
@@ -346,21 +624,29 @@ def morning_briefing(rows):
         rates_tone = curve["tone"]
     bullets.append({"label": "Rates", "text": rates_text, "tone": rates_tone})
 
-    # 6. Commodities
-    oil_word = ("firmer" if _sign(oil_chg) > 0 else "softer" if _sign(oil_chg) < 0 else "steady")
-    gold_word = ("bid" if _sign(gold_chg) > 0 else "offered" if _sign(gold_chg) < 0 else "flat")
-    comm_text = (f"Crude {oil_word} ({_pct(oil_chg)}); gold {gold_word} ({_pct(gold_chg)}) — "
-                 f"{'haven demand evident' if _sign(gold_chg) > 0 else 'limited haven demand'}.")
-    comm_tone = "caution" if _sign(gold_chg) > 0 and (avg_eq or 0) < 0 else "neutral"
+    # 6. Commodities — the haven clause reads off gold's own sign, so it can
+    #    never claim a bid while gold is negative.
+    gold_dir = _dir(gold_chg)
+    oil_dir = _dir(oil_chg)
+    oil_word = "firmer" if oil_dir > 0 else "softer" if oil_dir < 0 else "steady"
+    gold_word = "bid" if gold_dir > 0 else "offered" if gold_dir < 0 else "flat"
+    haven = ("haven demand evident" if gold_dir > 0
+             else "limited haven demand" if gold_dir < 0
+             else "no haven signal either way")
+    comm_text = (f"Crude {oil_word} ({_pct(oil_chg)}); gold {gold_word} "
+                 f"({_pct(gold_chg)}) — {haven}.")
+    comm_tone = "caution" if gold_dir > 0 and _dir(avg_eq) < 0 else "neutral"
     bullets.append({"label": "Commodities", "text": comm_text, "tone": comm_tone})
 
     # 7. Watch today (actionable)
-    kl = key_levels(rows)
     if curve["spread"] is not None and curve["spread"] < 0:
         watch = "Watch the inverted curve — any further inversion reinforces recession pricing."
         watch_tone = "neg"
     elif kl and kl["near_high"]:
-        watch = f"Watch S&P 500 {kl['high']:,.0f} — a test of the 52-week high; a clean break opens upside."
+        # Name both levels explicitly — the high is the target, not the price.
+        watch = (f"Watch the S&P 500 52-week high at {kl['high']:,.0f}, "
+                 f"{abs(kl['pct_from_high']):.1f}% above spot at {kl['price']:,.0f}; "
+                 f"a clean break opens upside.")
         watch_tone = "pos"
     elif vix is not None and vix >= 20:
         watch = "Watch volatility — a VIX move above 25 would confirm a risk-off shift."
@@ -391,11 +677,13 @@ def analyst_notebook(rows):
     btc = _get(rows, "BTC-USD")
     dxy = _get(rows, "DX-Y.NYB")
 
-    # 1. S&P key levels
+    # 1. S&P key levels — spot and the level are always named separately.
     if kl and kl["near_high"]:
-        notes.append(f"S&P near 52W high ({kl['high']:,.0f}) — watch for rejection or breakout")
+        notes.append(f"S&P {kl['price']:,.0f}, {abs(kl['pct_from_high']):.1f}% under the "
+                     f"52W high at {kl['high']:,.0f} — watch for rejection or breakout")
     elif kl and kl["near_low"]:
-        notes.append(f"S&P near 52W low ({kl['low']:,.0f}) — support zone, watch for a bounce or breakdown")
+        notes.append(f"S&P {kl['price']:,.0f}, {kl['pct_from_low']:+.1f}% off the "
+                     f"52W low at {kl['low']:,.0f} — support zone, watch for a bounce or breakdown")
     elif kl:
         notes.append(f"S&P mid-range at {kl['price']:,.0f} — no level urgency, let it come to me")
 
@@ -419,13 +707,20 @@ def analyst_notebook(rows):
         else:
             notes.append(f"2s10s {curve['spread_bps']:+.0f}bps — curve normal, no recession signal")
 
-    # 4. Gold vs equities cross-check
-    if _sign(gold_chg) > 0 and (avg_eq or 0) > 0:
-        notes.append("Gold bid alongside equities = unusual, monitor for a regime change")
-    elif _sign(gold_chg) > 0 and (avg_eq or 0) < 0:
-        notes.append("Gold bid as stocks slip — classic haven flows, risk-off creeping in")
-    elif _sign(gold_chg) < 0:
-        notes.append("Gold offered — haven demand light, risk appetite intact for now")
+    # 4. Gold vs equities cross-check (dead-banded on both legs)
+    gold_dir, eq_dir = _dir(gold_chg), _dir(avg_eq)
+    if gold_dir > 0 and eq_dir > 0:
+        notes.append(f"Gold bid ({_pct(gold_chg)}) alongside equities = unusual, "
+                     f"monitor for a regime change")
+    elif gold_dir > 0 and eq_dir < 0:
+        notes.append(f"Gold bid ({_pct(gold_chg)}) as stocks slip ({_pct(avg_eq)}) — "
+                     f"classic haven flows, risk-off creeping in")
+    elif gold_dir > 0:
+        notes.append(f"Gold bid ({_pct(gold_chg)}) into a flat tape — hedges being "
+                     f"added quietly, worth watching")
+    elif gold_dir < 0:
+        notes.append(f"Gold offered ({_pct(gold_chg)}) — haven demand light, "
+                     f"risk appetite intact for now")
 
     # 5. Stretched equity (best YTD performer)
     rated_ytd = [e for e in _equities(rows) if e.get("ytd_change_pct") is not None]
@@ -499,18 +794,24 @@ def decision_framework(rows):
                                    f"priced in — I stay long equities with no urgency to reduce risk."})
 
     # 3. Gold / equities -> stop management
-    if _sign(gold_chg) > 0 and (avg_eq or 0) >= 0:
+    gold_dir, eq_dir = _dir(gold_chg), _dir(avg_eq)
+    if gold_dir > 0 and eq_dir >= 0:
         points.append({"icon": "🥇", "title": "Gold + stocks both up",
-                       "text": "Gold rising with equities is a mixed signal — I trim nothing but I raise my "
-                               "stop-losses slightly as a precaution."})
-    elif _sign(gold_chg) > 0 and (avg_eq or 0) < 0:
+                       "text": f"Gold rising ({_pct(gold_chg)}) with equities ({_pct(avg_eq)}) is a mixed "
+                               f"signal — I trim nothing but I raise my stop-losses slightly as a precaution."})
+    elif gold_dir > 0:
         points.append({"icon": "🛡️", "title": "Haven bid",
-                       "text": "Gold bid while equities slip is textbook risk-off — I let winners run into the "
-                               "haven but add a small gold/duration hedge to the book."})
-    else:
+                       "text": f"Gold bid ({_pct(gold_chg)}) while equities slip ({_pct(avg_eq)}) is textbook "
+                               f"risk-off — I let winners run into the haven but add a small "
+                               f"gold/duration hedge to the book."})
+    elif gold_dir < 0:
         points.append({"icon": "🥇", "title": "Gold offered",
-                       "text": "Gold soft tells me haven demand is light — I'm comfortable carrying full equity "
-                               "risk and don't need a defensive overlay today."})
+                       "text": f"Gold soft ({_pct(gold_chg)}) tells me haven demand is light — I'm comfortable "
+                               f"carrying full equity risk and don't need a defensive overlay today."})
+    else:
+        points.append({"icon": "🥇", "title": "Gold flat",
+                       "text": "Gold is unchanged, so there is no haven signal to trade off — I leave the "
+                               "defensive overlay exactly where it was."})
 
     # 4. Regime -> overall posture
     posture = {
@@ -519,13 +820,18 @@ def decision_framework(rows):
         "Stress": "I move to capital preservation — raise cash, hedge aggressively, and wait for the dust to settle.",
         "Transitional": "Signals are mixed, so I keep balanced exposure and avoid making big directional bets.",
     }.get(regime["label"], "I keep balanced exposure until the cross-asset picture clarifies.")
-    points.append({"icon": "🎯", "title": f"Regime: {regime['label']}", "text": posture})
+    score = regime.get("score")
+    regime_title = (f"Regime: {regime['label']} ({score:+.2f})" if score is not None
+                    else f"Regime: {regime['label']}")
+    points.append({"icon": "🎯", "title": regime_title,
+                   "text": f"{posture} {regime['detail']}"})
 
     # 5. S&P key levels -> entries
     if kl and kl["near_high"]:
         points.append({"icon": "🚀", "title": "Pressing the highs",
-                       "text": f"S&P within 3% of its {kl['high']:,.0f} high — I wait for a clean break to add, "
-                               f"rather than chase into resistance and risk a rejection."})
+                       "text": f"S&P at {kl['price']:,.0f} is within 3% of its {kl['high']:,.0f} 52-week high "
+                               f"({kl['pct_from_high']:+.1f}%) — I wait for a clean break to add, rather than "
+                               f"chase into resistance and risk a rejection."})
     elif kl and kl["near_low"]:
         points.append({"icon": "🩹", "title": "Testing the lows",
                        "text": f"S&P near its {kl['low']:,.0f} low — I scale into longs in tranches so I'm not "
@@ -560,3 +866,219 @@ def decision_framework(rows):
                                    f"position, but it informs how aggressive I am elsewhere."})
 
     return points[:7]
+
+
+# --------------------------------------------------------------------------- #
+# Narrative / data consistency check
+# --------------------------------------------------------------------------- #
+# Guards against the class of bug where prose is selected by a label rather
+# than by the number it describes — e.g. "defensive bid in gold" printed on a
+# day gold closed -1.46%. Every directional phrase the briefing can emit is
+# paired here with the metric that must agree with it.
+
+def _check_metrics(rows):
+    """The raw values every narrative claim is validated against."""
+    stats = _equity_stats(rows)
+    curve = yield_curve(rows)
+    usd_raw, _ = _usd_read(rows)
+    return {
+        "gold":      {"value": _field(rows, "GC=F", "change_pct"), "unit": "pct",
+                      "name": "gold"},
+        "crude":     {"value": _field(rows, "CL=F", "change_pct"), "unit": "pct",
+                      "name": "crude"},
+        "equities":  {"value": stats["mean"] if stats else None, "unit": "pct",
+                      "name": "average index move"},
+        "yield_10y": {"value": _field(rows, "^TNX", "change_pct"), "unit": "pct",
+                      "name": "10Y yield change"},
+        "vix":       {"value": _field(rows, "^VIX", "price"), "unit": "level",
+                      "name": "VIX"},
+        "curve_bps": {"value": curve["spread_bps"], "unit": "bps",
+                      "name": "2s10s spread"},
+        "usd":       {"value": float(usd_raw), "unit": "score",
+                      "name": "USD direction score"},
+        "breadth":   {"value": stats["breadth"] if stats else None,
+                      "unit": "ratio", "name": "equity breadth"},
+        # 1.0 when breadth and the average point the same way (or either is
+        # flat), 0.0 when one index is dragging the mean against the breadth.
+        "eq_agreement": {
+            "value": (None if stats is None else
+                      float(_dir(stats["mean"]) == 0
+                            or _dir(stats["breadth"], 0.0) == 0
+                            or _dir(stats["mean"]) == _dir(stats["breadth"], 0.0))),
+            "unit": "flag", "name": "breadth/average agreement"},
+    }
+
+
+# (regex, metric key, predicate the metric must satisfy, plain-English rule)
+_NARRATIVE_RULES = [
+    (r"haven demand evident|defensive bid|gold (?:is )?bid|haven bid"
+     r"|gold (?:is )?firmer|gold rising|hedging demand",
+     "gold", lambda v: v > 0, "gold must be positive to claim a haven/hedging bid"),
+    (r"limited haven demand|limited safe-haven demand|gold (?:is )?offered"
+     r"|gold (?:is )?soft|haven demand is light",
+     "gold", lambda v: v < 0, "gold must be negative to call haven demand light"),
+    (r"no haven signal|gold is unchanged|gold flat",
+     "gold", lambda v: abs(v) <= FLAT_PCT, "gold must be inside the flat band"),
+
+    (r"crude firmer", "crude", lambda v: v > FLAT_PCT, "crude must be up"),
+    (r"crude softer", "crude", lambda v: v < -FLAT_PCT, "crude must be down"),
+
+    (r"equities extend gains|equities climb|equities (?:and bonds )?are rallying"
+     r"|breadth .{0,20}constructive",
+     "equities", lambda v: v > FLAT_PCT,
+     "the average index move must be meaningfully positive"),
+    (r"equities trade lower|equities soft|equities slip|equities fall"
+     r"|equities are under pressure|stocks slip",
+     "equities", lambda v: v < -FLAT_PCT,
+     "the average index move must be meaningfully negative"),
+    (r"equities trade broadly flat|little changed|flat tape",
+     "equities", lambda v: abs(v) <= FLAT_PCT,
+     "the average index move must be inside the flat band"),
+
+    # A directional equity claim also needs breadth to agree with the average,
+    # otherwise one outlier index is speaking for the whole complex.
+    (r"equities extend gains|equities trade lower|equities climb|equities fall",
+     "eq_agreement", lambda v: v == 1.0,
+     "breadth and the average must agree before calling a direction"),
+    (r"equities are mixed", "eq_agreement", lambda v: v == 0.0,
+     "breadth and the average must actually disagree to call the tape mixed"),
+    (r"textbook risk-off|flight-to-quality|flight to quality",
+     "breadth", lambda v: v <= 0,
+     "equity breadth must not be positive to call it a broad flight to quality"),
+
+    (r"easing yields|yields ease|bonds catch a bid",
+     "yield_10y", lambda v: v < 0, "the 10Y yield must be falling"),
+    (r"rising yields|yields higher|bonds sell off",
+     "yield_10y", lambda v: v > 0, "the 10Y yield must be rising"),
+
+    (r"subdued volatility|calm, risk-tolerant|hedges still cheap|options are cheap",
+     "vix", lambda v: v < 20, "VIX must be below 20"),
+    (r"above-average volatility|nerves building|markets are nervous",
+     "vix", lambda v: 20 <= v < 30, "VIX must be between 20 and 30"),
+    (r"elevated volatility|acute market stress|stress!",
+     "vix", lambda v: v >= 30, "VIX must be at or above 30"),
+
+    (r"inverted|inversion", "curve_bps", lambda v: v < 0,
+     "the 2s10s spread must be negative"),
+    (r"curve normal|curve reads normal|no recession signal|no imminent recession",
+     "curve_bps", lambda v: v >= 50, "the 2s10s spread must be 50bps or steeper"),
+    (r"curve flat|curve is flat|reads flattening", "curve_bps",
+     lambda v: 0 <= v < 50, "the 2s10s spread must be between 0 and 50bps"),
+
+    (r"dollar (?:is )?(?:broadly )?firmer|firmer dollar",
+     "usd", lambda v: v >= 2, "the USD score must show broad dollar strength"),
+    (r"dollar (?:is )?(?:broadly )?softer|softer dollar",
+     "usd", lambda v: v <= -2, "the USD score must show broad dollar weakness"),
+]
+
+
+# Prose legitimately negates a phrase ("rather than a broad flight to quality",
+# "no haven demand"). A negated mention makes no directional claim, so the rule
+# must not fire on it.
+# Word-boundary matched so "cannot" / "another" do not read as negations.
+_NEGATION_RE = re.compile(
+    r"\b(?:rather than|instead of|not|no|never|without|isn't|aren't|"
+    r"far from|nothing)\b", re.IGNORECASE)
+
+# How far back to look for a negation governing the match.
+_NEGATION_WINDOW = 30
+
+
+def _is_negated(text, start):
+    """True if a negation governs the phrase matched at *start*.
+
+    Only the clause containing the match is considered — a negation on the far
+    side of a comma, dash or semicolon belongs to a different claim, so
+    "Gold is offered; haven demand evident" is still correctly flagged.
+    """
+    window = text[max(0, start - _NEGATION_WINDOW):start]
+    for boundary in (";", "—", " - ", ","):
+        if boundary in window:
+            window = window.rsplit(boundary, 1)[1]
+    return bool(_NEGATION_RE.search(window))
+
+
+def _format_metric(metric):
+    value, unit = metric["value"], metric["unit"]
+    if value is None:
+        return "n/a"
+    if unit == "pct":
+        return f"{value:+.2f}%"
+    if unit == "bps":
+        return f"{value:+.0f}bps"
+    if unit == "level":
+        return f"{value:.2f}"
+    if unit == "ratio":
+        return f"{value:+.2f}"
+    if unit == "flag":
+        return "agree" if value == 1.0 else "disagree"
+    return f"{value:+.0f}"
+
+
+def narrative_sections(rows):
+    """Every generated sentence in the briefing, tagged with its source."""
+    brief = morning_briefing(rows)
+    sections = [("briefing paragraph", brief["paragraph"])]
+    for bullet in brief["bullets"]:
+        sections.append((f"bullet · {bullet['label']}", bullet["text"]))
+    sections.append(("correlation note", correlation_note(rows)))
+    for i, note in enumerate(analyst_notebook(rows), 1):
+        sections.append((f"notebook {i}", note))
+    for point in decision_framework(rows):
+        sections.append((f"framework · {point['title']}", point["text"]))
+    return sections
+
+
+def consistency_check(rows, sections=None):
+    """Cross-check every directional claim in the narrative against its metric.
+
+    Returns {issues, claims_checked, sections_checked}. Each issue is
+    {source, phrase, metric, value, rule, text} — the sentence that made the
+    claim, and the number that contradicts it. An empty ``issues`` list means
+    no sentence disagrees with the data behind it.
+    """
+    metrics = _check_metrics(rows)
+    if sections is None:
+        sections = narrative_sections(rows)
+
+    issues, claims = [], 0
+    for source, text in sections:
+        for pattern, key, predicate, rule in _NARRATIVE_RULES:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                metric = metrics[key]
+                if metric["value"] is None:
+                    continue  # nothing to contradict
+                if _is_negated(text, match.start()):
+                    continue  # a denied claim is not a claim
+                claims += 1
+                if predicate(metric["value"]):
+                    continue
+                issues.append({
+                    "source": source,
+                    "phrase": match.group(0),
+                    "metric": metric["name"],
+                    "value": _format_metric(metric),
+                    "rule": rule,
+                    "text": text,
+                })
+    return {"issues": issues, "claims_checked": claims,
+            "sections_checked": len(sections)}
+
+
+def print_consistency_check(rows, indent="      "):
+    """Run the check and report it on the console. Returns the result dict."""
+    result = consistency_check(rows)
+    issues = result["issues"]
+    if not issues:
+        print(f"{indent}Narrative consistency: OK — {result['claims_checked']} "
+              f"directional claim(s) across {result['sections_checked']} "
+              f"sentence(s) agree with the data.")
+        return result
+
+    print(f"{indent}! Narrative consistency: {len(issues)} contradiction(s) in "
+          f"{result['claims_checked']} checked claim(s):")
+    for issue in issues:
+        print(f"{indent}  ! [{issue['source']}] says \"{issue['phrase']}\" but "
+              f"{issue['metric']} = {issue['value']} — {issue['rule']}.")
+        print(f"{indent}    > {issue['text']}")
+    return result

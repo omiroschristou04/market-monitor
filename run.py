@@ -36,6 +36,7 @@ try:
 except ImportError:  # python-dotenv is listed in requirements.txt
     load_dotenv = None
 
+from src.analysis import print_consistency_check
 from src.email_report import send_email
 from src.fetch import fetch_all_tickers
 from src.news import fetch_headlines
@@ -173,8 +174,11 @@ def main():
     headlines = fetch_headlines()
     print(f"      Collected {len(headlines)} headline(s).")
 
-    # 5. Report
+    # 5. Report. The consistency check runs first and flags any sentence whose
+    #    direction disagrees with the metric behind it (e.g. "haven demand"
+    #    while gold is negative). It reports; it never blocks the briefing.
     print("\n[5/8] Generating HTML report...")
+    print_consistency_check(rows)
     report_path = generate_report(rows, headlines=headlines)
     print(f"      Report written to: {report_path}")
 
