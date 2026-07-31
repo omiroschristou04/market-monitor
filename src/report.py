@@ -14,9 +14,13 @@ Design language
   body copy, IBM Plex Mono for *every* number, price and percentage, and
   Caveat for the handwritten notebook. Numbers use ``tabular-nums`` so
   columns align to a common baseline.
-* **Colour** — a layered navy (page off-white, cards pure white, headers deep
-  navy with subtle radial depth) plus exactly three signal colours: green,
-  red and amber, used sparingly.
+* **Colour** — a full dark terminal. The page is a deep navy-grey with a
+  subtle vertical gradient (#0e1a2b to #16202e), cards sit a step above it on
+  #17243a behind a hairline border, and the masthead is deeper navy still with
+  radial depth. Exactly three signal colours — green, red, amber — used
+  sparingly, in their on-dark variants. Every text/background pair clears WCAG
+  AA (the weakest is 5.3:1; most exceed 7:1). The analyst notebook keeps its
+  cream paper as the one deliberate light surface.
 * **Space** — an 8px spacing rhythm, hairline dividers, soft shadows, and
   small uppercase micro-labels above key numbers.
 
@@ -45,27 +49,48 @@ CHART_CLASSES = ["Equity", "FX", "Commodity"]
 # --------------------------------------------------------------------------- #
 # Colour language
 #
-# Three signal colours only — green, red, amber — plus a neutral slate. Each
-# has an on-dark counterpart so the same semantic reads correctly against the
-# navy masthead and briefing card.
+# The page is a dark institutional terminal, so the on-dark signal colours ARE
+# the page colours: three signals only — green, red, amber — plus a neutral
+# slate, each chosen to clear WCAG AA against every dark surface below (they
+# range 5.3:1 to 10.9:1; see the surface constants).
+#
+# The light-context pair is retained for the one deliberate exception, the
+# notebook's cream paper, and for ink on the chart canvas.
 # --------------------------------------------------------------------------- #
-POS = "#0f7f5b"      # signal green — positive
-NEG = "#c0392f"      # signal red   — negative
-AMBER = "#b0761c"    # signal amber — caution
-NEUTRAL = "#5b6b7f"  # slate        — neutral
+POS = "#34d399"      # signal green — positive
+NEG = "#f87171"      # signal red   — negative
+AMBER = "#fbbf24"    # signal amber — caution
+NEUTRAL = "#94a3b8"  # slate        — neutral
 
-POS_DK = "#34d399"     # on-navy variants
-NEG_DK = "#f87171"
-AMBER_DK = "#fbbf24"
-NEUTRAL_DK = "#94a3b8"
+POS_DK, NEG_DK, AMBER_DK, NEUTRAL_DK = POS, NEG, AMBER, NEUTRAL
+
+POS_LT = "#0f7f5b"     # on-cream / on-white variants
+NEG_LT = "#c0392f"
+AMBER_LT = "#b0761c"
+NEUTRAL_LT = "#5b6b7f"
 
 NAVY = "#0a1628"
 NAVY_MID = "#16304d"
 
-# Map semantic tones from analysis -> colours (light and on-dark contexts).
+# Dark surfaces, lightest-on-top. The page carries a subtle vertical gradient
+# between PAGE_TOP and PAGE_BOT; cards sit above it on SURFACE, and inset
+# blocks (KPI tiles) a step lighter again on SURFACE_2.
+PAGE_TOP = "#0e1a2b"
+PAGE_BOT = "#16202e"
+SURFACE = "#17243a"
+SURFACE_2 = "#1b2942"
+LINE = "#27364e"       # card borders / table rules
+HAIRLINE = "#202d43"   # inner dividers
+
+INK = "#eaf1f9"        # headings and numbers      13.7:1 on SURFACE
+INK_2 = "#c2d0e0"      # body copy                  9.9:1
+MUTED = "#9fb0c4"      # secondary copy             7.0:1
+MUTED_2 = "#93a6bd"    # 10px uppercase micro-labels 6.2:1
+
+# Map semantic tones from analysis -> colours. One map now: every surface that
+# carries a tone is dark.
 TONE_COLOURS = {"pos": POS, "neg": NEG, "caution": AMBER, "neutral": NEUTRAL}
-TONE_COLOURS_DK = {"pos": POS_DK, "neg": NEG_DK,
-                   "caution": AMBER_DK, "neutral": NEUTRAL_DK}
+TONE_COLOURS_DK = TONE_COLOURS
 
 # Asset-class tag colours.
 ASSET_COLOURS = {
@@ -84,8 +109,15 @@ SOURCE_COLOURS = {
     "BBC Business": "#b91c1c",
 }
 
-# Restrained institutional line colours for the trend charts.
-CHART_COLOURS = ["#16304d", "#2b6ea8", "#0f766e", "#a16207", "#c0392f", "#7c3aed"]
+# Restrained institutional line colours for the trend charts. Brightened for
+# the dark canvas — the old near-navy first entry was invisible on it.
+CHART_COLOURS = ["#7fb2ff", "#34d399", "#fbbf24", "#f87171", "#c4a6f7", "#5ecfd6"]
+
+# Chart ink on the dark canvas.
+CHART_BG = SURFACE
+CHART_GRID = "#26344a"
+CHART_AXIS = "#334459"
+CHART_TEXT = MUTED_2
 
 
 # --------------------------------------------------------------------------- #
@@ -114,13 +146,19 @@ def _move_colour(value):
     return POS if value > 0 else NEG
 
 
-def _darken(hex_colour, factor=0.72):
-    """Return a darker shade of a #rrggbb colour (factor < 1 = darker)."""
+def _lighten(hex_colour, factor=0.55):
+    """Mix a #rrggbb colour toward white.
+
+    Brand tags (Equity blue, BBC red) are chosen for white pages and go muddy
+    against a dark card, so their *text* is lifted by this while the signal dot
+    keeps the full-strength colour. Replaces the old ``_darken``, which did the
+    same job in the opposite direction back when the cards were white.
+    """
     hex_colour = hex_colour.lstrip("#")
     if len(hex_colour) != 6:
         return "#" + hex_colour
     r, g, b = (int(hex_colour[i:i + 2], 16) for i in (0, 2, 4))
-    r, g, b = (max(0, min(255, int(c * factor))) for c in (r, g, b))
+    r, g, b = (round(c + (255 - c) * factor) for c in (r, g, b))
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
@@ -166,15 +204,16 @@ def _last_n(history, n=30):
 def _badge(label, colour):
     """A restrained tag: hairline border, faint tint, small signal dot.
 
-    Text is darkened for contrast against the tint while the dot keeps the
+    Text is lifted toward white for contrast against the tint on the dark card
+    (every tag clears AA at 6.4:1 or better) while the dot keeps the
     full-strength colour, so the tag reads as a quiet label rather than a
     heavy pill.
     """
-    text = _darken(colour, 0.78)
+    text = _lighten(colour, 0.55)
     return (
         f'<span class="tag" style="color:{text};'
-        f'background:{_rgba(colour, 0.07)};'
-        f'border:1px solid {_rgba(colour, 0.24)}">'
+        f'background:{_rgba(colour, 0.12)};'
+        f'border:1px solid {_rgba(colour, 0.34)}">'
         f'<span class="tag-dot" style="background:{colour}"></span>'
         f'{html.escape(label)}</span>'
     )
@@ -208,8 +247,8 @@ def _chart_base64(series):
     legend sit at the top without colliding with anything.
     """
     fig, ax = plt.subplots(figsize=(8.0, 2.9), dpi=160)
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
+    fig.patch.set_facecolor(CHART_BG)
+    ax.set_facecolor(CHART_BG)
 
     for idx, (label, points) in enumerate(series):
         if not points:
@@ -222,24 +261,24 @@ def _chart_base64(series):
         ax.plot(dates, values, linewidth=1.5, solid_capstyle="round",
                 color=CHART_COLOURS[idx % len(CHART_COLOURS)], label=label)
 
-    ax.axhline(0, color="#cbd5e1", linewidth=0.9)
-    ax.set_ylabel("% vs 30d ago", fontsize=7.5, color="#8a99ab", labelpad=8)
+    ax.axhline(0, color=CHART_AXIS, linewidth=0.9)
+    ax.set_ylabel("% vs 30d ago", fontsize=7.5, color=CHART_TEXT, labelpad=8)
     ax.legend(fontsize=7.5, loc="lower left", frameon=False, ncol=6,
-              handlelength=1.6, columnspacing=1.6, labelcolor="#33445a",
+              handlelength=1.6, columnspacing=1.6, labelcolor=INK_2,
               borderaxespad=0, bbox_to_anchor=(0, 1.02))
-    ax.grid(True, axis="y", color="#eef1f5", linewidth=0.9)
+    ax.grid(True, axis="y", color=CHART_GRID, linewidth=0.9)
     ax.set_axisbelow(True)
-    ax.tick_params(labelsize=7.5, colors="#8a99ab", length=0, pad=6)
+    ax.tick_params(labelsize=7.5, colors=CHART_TEXT, length=0, pad=6)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     for spine in ("left", "bottom"):
-        ax.spines[spine].set_color("#e4e8ee")
+        ax.spines[spine].set_color(CHART_AXIS)
         ax.spines[spine].set_linewidth(0.9)
     fig.autofmt_xdate(rotation=0, ha="center")
     fig.tight_layout()
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor="white")
+    fig.savefig(buf, format="png", facecolor=CHART_BG)
     plt.close(fig)
     buf.seek(0)
     encoded = base64.b64encode(buf.read()).decode("ascii")
@@ -535,10 +574,11 @@ def _news_section(headlines):
                          f'<img loading="lazy" alt="" '
                          f'src="{html.escape(image, quote=True)}"></div>')
             else:
-                # Muted placeholder carrying the source name.
-                thumb = (f'<div class="news-thumb news-thumb-ph" '
-                         f'style="background:linear-gradient(155deg,'
-                         f'{_darken(colour, 0.92)},{_darken(colour, 0.62)})">'
+                # No reachable thumbnail (Reuters answers 401 to any scraper).
+                # A single restrained tile for every source — a flat block in
+                # each brand's colour read as a rendering fault, and made the
+                # Reuters column a wall of orange.
+                thumb = ('<div class="news-thumb news-thumb-ph">'
                          f'<span>{html.escape(h["source"])}</span></div>')
             items.append(f"""
             <div class="news-item">
@@ -579,9 +619,10 @@ _TOKENS = f"""
     :root {{
         --navy-900:#050d1a; --navy-800:{NAVY}; --navy-700:#0f2137;
         --navy-600:{NAVY_MID};
-        --ink:#0d1826; --ink-2:#33445a; --muted:#64748b; --muted-2:#8a99ab;
-        --line:#e4e8ee; --hairline:#eef1f5;
-        --bg:#f4f6f9; --surface:#ffffff; --surface-2:#f8fafc;
+        --ink:{INK}; --ink-2:{INK_2}; --muted:{MUTED}; --muted-2:{MUTED_2};
+        --line:{LINE}; --hairline:{HAIRLINE};
+        --bg-top:{PAGE_TOP}; --bg-bot:{PAGE_BOT}; --bg:{PAGE_TOP};
+        --surface:{SURFACE}; --surface-2:{SURFACE_2};
         --pos:{POS}; --neg:{NEG}; --amber:{AMBER};
         --serif:"Libre Baskerville",Georgia,"Times New Roman",serif;
         --sans:"Inter","Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif;
@@ -594,8 +635,15 @@ _TOKENS = f"""
 _RULES = r"""
     *,*::before,*::after { box-sizing: border-box; }
     html { -webkit-text-size-adjust: 100%; }
+    /* Deep navy-grey page with a subtle vertical gradient. Fixed attachment so
+       the wash reads as one continuous surface however long the page runs,
+       instead of restarting per viewport. */
     body {
-        margin: 0; background: var(--bg); color: var(--ink);
+        margin: 0; color: var(--ink-2);
+        background: var(--bg-bot);
+        background-image: linear-gradient(180deg,
+            var(--bg-top) 0%, #111d2e 48%, var(--bg-bot) 100%);
+        background-attachment: fixed;
         font-family: var(--sans); font-size: 14px; line-height: 1.55;
         -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
     }
@@ -623,7 +671,7 @@ _RULES = r"""
         background:
             radial-gradient(900px 320px at 12% -30%, rgba(43,110,168,.30), transparent 62%),
             radial-gradient(700px 260px at 92% 0%, rgba(47,125,140,.16), transparent 60%),
-            linear-gradient(180deg,#0c1e35 0%,#0a1628 62%,#081221 100%);
+            linear-gradient(180deg,#0c1e35 0%,#0a1628 58%,#0e1a2b 100%);
         box-shadow: inset 0 -1px 0 rgba(255,255,255,.09);
         animation: fadeIn .7s ease both;
     }
@@ -666,11 +714,15 @@ _RULES = r"""
     .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 64px; }
 
     /* ---------- cards ---------- */
+    /* Dark cards lifted off the page by a hairline and a soft drop shadow —
+       on a dark ground a shadow alone reads as nothing, so the border does
+       most of the separating work. */
     .card {
         background: var(--surface); border: 1px solid var(--line);
         border-radius: 10px; padding: 28px 32px; margin-bottom: 24px;
-        box-shadow: 0 1px 2px rgba(13,24,38,.04),
-                    0 14px 30px -20px rgba(13,24,38,.30);
+        color: var(--ink-2);
+        box-shadow: 0 1px 0 rgba(255,255,255,.03) inset,
+                    0 18px 38px -24px rgba(0,0,0,.75);
     }
     .card:last-of-type { margin-bottom: 0; }
     .reveal {
@@ -759,7 +811,7 @@ _RULES = r"""
     table.snap th.left, table.snap td.name { text-align: left; }
     table.snap th.right-tag, table.snap td.tag-cell { text-align: right; }
     table.snap tbody tr { transition: background-color .18s ease; }
-    table.snap tbody tr:hover { background: #f7f9fc; }
+    table.snap tbody tr:hover { background: rgba(255,255,255,.045); }
     table.snap tbody tr:last-child td { border-bottom: none; }
     td.name {
         font-family: var(--sans); font-size: 13.5px; font-weight: 600;
@@ -775,10 +827,12 @@ _RULES = r"""
 
     /* ---------- KPI blocks ---------- */
     .kpi-row { display: flex; flex-wrap: wrap; gap: 16px; }
+    /* Accent rule is a mid slate-blue: the old deep navy was invisible once
+       the tile beneath it went dark. */
     .kpi {
         flex: 1 1 180px; min-width: 0; padding: 16px 18px;
         background: var(--surface-2); border: 1px solid var(--line);
-        border-top: 2px solid var(--navy-600); border-radius: 0 0 6px 6px;
+        border-top: 2px solid #3d7fb8; border-radius: 0 0 6px 6px;
     }
     .kpi-label { color: var(--muted-2); }
     .kpi-value {
@@ -792,8 +846,10 @@ _RULES = r"""
         border-radius: 3px; font-family: var(--mono); font-size: 9.5px;
         font-weight: 600; text-transform: uppercase; letter-spacing: .1em;
     }
-    .flag-pos { background: #e6f4ee; color: #0b5f44; }
-    .flag-neg { background: #fbeceb; color: #8f2a22; }
+    .flag-pos { background: rgba(52,211,153,.14); color: #6ee7b7;
+        border: 1px solid rgba(52,211,153,.30); }
+    .flag-neg { background: rgba(248,113,113,.14); color: #fca5a5;
+        border: 1px solid rgba(248,113,113,.30); }
 
     /* ---------- explanatory copy ---------- */
     .explain {
@@ -805,9 +861,13 @@ _RULES = r"""
         font-size: 16px; line-height: 1.8; color: var(--ink);
     }
 
-    /* ---------- GS notebook — lined cream paper, red margin rule ---------- */
+    /* ---------- GS notebook — lined cream paper, red margin rule ----------
+       The one deliberate light surface on the page: a sheet of paper laid on
+       the terminal. It re-declares its own ink so nothing inherits the light
+       body colour that every other card relies on. */
     .notebook {
-        background-color: #fbf8f0; border-color: #e8dfc9;
+        background-color: #fbf8f0; border-color: #cdbf9f; color: #33455f;
+        box-shadow: 0 20px 44px -26px rgba(0,0,0,.85);
         background-image:
             linear-gradient(90deg, transparent 56px, #e8c4c4 56px, #e8c4c4 57px, transparent 57px),
             repeating-linear-gradient(#fbf8f0, #fbf8f0 33px, #e3e8ef 34px);
@@ -831,13 +891,15 @@ _RULES = r"""
     .tp-item:last-child { border-bottom: none; padding-bottom: 0; }
     .tp-num {
         flex: 0 0 auto; width: 30px; height: 30px; border-radius: 5px;
-        background: linear-gradient(160deg,#17324f,#0a1628); color: #dce7f3;
+        background: linear-gradient(160deg,#24405f,#152740); color: #dce7f3;
+        border: 1px solid rgba(255,255,255,.10);
         font-family: var(--mono); font-size: 11px; font-weight: 600;
         letter-spacing: .04em; display: flex; align-items: center;
-        justify-content: center; box-shadow: 0 2px 8px -3px rgba(10,22,40,.6);
+        justify-content: center; box-shadow: 0 2px 8px -3px rgba(0,0,0,.7);
     }
     .tp-body { flex: 1 1 auto; min-width: 0; }
-    .tp-title { font-size: 14.5px; font-weight: 600; color: var(--navy-800);
+    /* var(--navy-800) here was near-black — invisible on a dark card. */
+    .tp-title { font-size: 14.5px; font-weight: 600; color: var(--ink);
         letter-spacing: -.005em; }
     .tp-icon { margin-right: 8px; }
     .tp-text { margin-top: 6px; font-size: 13.5px; line-height: 1.7;
@@ -857,20 +919,36 @@ _RULES = r"""
         border-bottom: 1px solid var(--hairline);
         transition: background-color .18s ease;
     }
-    .news-item:hover { background: #f7f9fc; }
+    .news-item:hover { background: rgba(255,255,255,.045); }
     .news-item:last-child { border-bottom: none; }
     .news-thumb {
         flex: 0 0 auto; width: 116px; height: 78px; border-radius: 6px;
-        overflow: hidden; background: #e8edf3; border: 1px solid var(--hairline);
+        overflow: hidden; background: #101b2b; border: 1px solid var(--line);
     }
     .news-thumb img { width: 100%; height: 100%; object-fit: cover; display: block;
         transition: transform .5s cubic-bezier(.16,1,.3,1); }
     .news-item:hover .news-thumb img { transform: scale(1.05); }
-    .news-thumb-ph { display: flex; align-items: center; justify-content: center;
-        padding: 8px; text-align: center; border: none; }
+
+    /* Placeholder tile for articles whose publisher blocks thumbnail scraping.
+       One treatment for every source — a subtle dark gradient, a thin border
+       and the source name set small in refined uppercase — so a missing image
+       reads as a deliberate typographic tile rather than a broken block of
+       brand colour. The faint diagonal sheen keeps it from looking flat. */
+    .news-thumb-ph {
+        display: flex; align-items: center; justify-content: center;
+        padding: 8px; text-align: center;
+        background:
+            linear-gradient(135deg, rgba(255,255,255,.05) 0%,
+                            transparent 42%, transparent 58%,
+                            rgba(0,0,0,.16) 100%),
+            linear-gradient(160deg, #22334c 0%, #16233a 52%, #101a2a 100%);
+        border: 1px solid rgba(255,255,255,.10);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+    }
     .news-thumb-ph span {
-        color: #fff; font-family: var(--mono); font-size: 10px; font-weight: 600;
-        text-transform: uppercase; letter-spacing: .12em; line-height: 1.35;
+        color: #b9c8db; font-family: var(--mono); font-size: 9px;
+        font-weight: 500; text-transform: uppercase; letter-spacing: .22em;
+        line-height: 1.4; text-indent: .22em;
     }
     .news-content { flex: 1 1 auto; min-width: 0; }
     .news-meta { display: flex; align-items: center; gap: 12px; margin-bottom: 8px;
@@ -880,7 +958,7 @@ _RULES = r"""
         display: block; color: var(--ink); text-decoration: none; font-size: 15px;
         font-weight: 600; line-height: 1.45; letter-spacing: -.005em;
     }
-    .news-title:hover { color: #1d4ed8; text-decoration: underline;
+    .news-title:hover { color: #7fb2ff; text-decoration: underline;
         text-underline-offset: 3px; }
 
     .empty { color: var(--muted); font-style: italic; margin: 8px 0; }
@@ -892,7 +970,7 @@ _RULES = r"""
         flex-wrap: wrap; color: var(--muted-2); }
     .foot-row .foot-brand { color: var(--muted); font-weight: 600; }
     .foot-note { margin-top: 16px; font-size: 11.5px; line-height: 1.7;
-        color: #9aa8b8; }
+        color: var(--muted); }
 
     /* ---------- responsive ---------- */
     @media (max-width: 760px) {
@@ -920,8 +998,13 @@ _RULES = r"""
         .masthead { animation: none; }
         .news-item, .news-thumb img, table.snap tbody tr { transition: none; }
     }
+    /* The palette IS the design here, so printing keeps it rather than
+       dropping to white paper and stranding light text on it. */
     @media print {
-        body { background: #fff; }
+        html, body {
+            background: var(--bg-top) !important;
+            -webkit-print-color-adjust: exact; print-color-adjust: exact;
+        }
         .topbar { display: none; }
         .card { box-shadow: none; break-inside: avoid; page-break-inside: avoid; }
         .reveal { opacity: 1; transform: none; }
@@ -1061,7 +1144,8 @@ def generate_report(rows, headlines=None, reports_dir=REPORTS_DIR):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="{PAGE_TOP}">
 <title>Morning Market Briefing &middot; {long_date}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>

@@ -110,6 +110,20 @@ REGIME_WEIGHTS = {
 RISK_ON_AT = 0.30
 RISK_OFF_AT = -0.30
 
+# A component must clear this on its OWN score before the Sentiment line may
+# name it as leaning risk-on or risk-off. Selecting on *contribution* alone was
+# not enough: VIX 19.5 scores only -0.13, but at a 0.30 weight that cleared the
+# old 0.02 contribution gate, so the briefing printed "gold +2.51% and vix 19.5
+# lean risk-off" on the same page where the Volatility line called the identical
+# level "a calm, risk-tolerant tape". Inside this band a component is neutral
+# and is described as neutral — never as a lean in either direction.
+COMPONENT_LEAN_AT = 0.20
+
+# A 10Y move smaller than this is flat, not "rising" or "easing". ^TNX
+# change_pct is the percentage change in the yield itself, so +0.03% on a 4.6%
+# yield is a fraction of a basis point and must not read as rising yields.
+YIELD_FLAT_PCT = 0.05
+
 FX_PAIRS = ("EURUSD=X", "GBPUSD=X", "JPY=X")
 
 
@@ -287,11 +301,16 @@ def market_regime(rows):
     else:
         label, tone = "Transitional", "caution"
 
-    # Detail is assembled from the components that moved the number.
-    supports = sorted((c for c in components if c["contribution"] > 0.02),
+    # Detail is assembled from the components that moved the number. Group
+    # membership keys off each component's OWN score against COMPONENT_LEAN_AT,
+    # not off its weighted contribution: a heavily-weighted component sitting
+    # in its neutral band still has nothing directional to say, and listing it
+    # as a lean contradicts the bullet that describes that same reading.
+    supports = sorted((c for c in components if c["score"] >= COMPONENT_LEAN_AT),
                       key=lambda c: -c["contribution"])
-    drags = sorted((c for c in components if c["contribution"] < -0.02),
+    drags = sorted((c for c in components if c["score"] <= -COMPONENT_LEAN_AT),
                    key=lambda c: c["contribution"])
+    neutrals = [c for c in components if abs(c["score"]) < COMPONENT_LEAN_AT]
 
     parts = [f"cross-asset score {score:+.2f}"]
     if supports:
@@ -302,7 +321,13 @@ def market_regime(rows):
         parts.append(f"{_join_phrases(drags)} {verb} risk-off")
     if not supports and not drags:
         parts.append("every component reads neutral")
-    detail = "; ".join(parts).capitalize() + "."
+    elif neutrals:
+        verb = "reads" if len(neutrals) == 1 else "read"
+        parts.append(f"{_join_phrases(neutrals)} {verb} neutral")
+    # Uppercase only the first letter — str.capitalize() would lowercase the
+    # rest of the sentence and turn "VIX 19.5" into "vix 19.5".
+    detail = "; ".join(parts)
+    detail = detail[0].upper() + detail[1:] + "."
 
     return {"label": label, "tone": tone, "detail": detail,
             "score": score, "components": components}
@@ -382,13 +407,38 @@ def correlation_note(rows):
 
     # Dead-banded so a flat tape is not described as a rally or a selloff.
     eq_dir = _dir(avg_eq)
-    bond_dir = -_dir(yield_chg, 0.05)  # yields up => bond prices down
+    bond_dir = -_dir(yield_chg, YIELD_FLAT_PCT)  # yields up => bond prices down
     gold_dir = _dir(gold_chg)
+
+    # Breadth has to agree with the average before either direction is claimed.
+    # One outlier can carry the mean on its own — a +4.03% Nikkei against four
+    # small decliners lifts the average to +0.64% while 4 of 5 indices are
+    # lower — and "equities climb ... a classic reflationary, risk-on
+    # configuration" then contradicts the four. This is the same guard
+    # _equity_phrase applies to the briefing paragraph.
+    breadth_dir = _dir(stats["breadth"], 0.0) if stats else 0
+    eq_mixed = eq_dir != 0 and breadth_dir != 0 and eq_dir != breadth_dir
+    if eq_mixed:
+        eq_dir = 0
 
     eq_val = f"average index move {_pct(avg_eq)}" if avg_eq is not None else "equities n/a"
     y_val = f"10Y yield {_pct(yield_chg)}" if yield_chg is not None else "10Y n/a"
 
-    if eq_dir == 0 and bond_dir == 0:
+    if eq_mixed and bond_dir > 0 and stats["breadth"] > 0:
+        # Most indices rose but one decliner drags the mean negative, and bonds
+        # are bid: a rates-led move, not a broad flight to quality. Named
+        # explicitly because the interpretation is worth more than "mixed".
+        base = (f"Bonds catch a bid while equity breadth stays positive "
+                f"({stats['up']} of {stats['n']} indices higher, {eq_val}, "
+                f"{y_val}) — a rates-led move rather than a broad flight to quality.")
+    elif eq_mixed:
+        bond_word = ("bonds catch a bid" if bond_dir > 0
+                     else "bonds sell off" if bond_dir < 0
+                     else "bonds are little changed")
+        base = (f"Equities are mixed ({stats['up']} of {stats['n']} indices "
+                f"higher, {eq_val}) while {bond_word} ({y_val}) — dispersion "
+                f"inside the equity complex rather than one cross-asset theme.")
+    elif eq_dir == 0 and bond_dir == 0:
         base = (f"Equities and bonds are little changed ({eq_val}, {y_val}), "
                 f"offering few cross-asset signals today.")
     elif eq_dir > 0 and bond_dir > 0:
@@ -398,14 +448,10 @@ def correlation_note(rows):
         base = (f"Equities climb while bonds sell off ({eq_val}, {y_val}) — a classic "
                 f"reflationary, risk-on configuration.")
     elif eq_dir < 0 and bond_dir > 0:
-        if stats and stats["breadth"] > 0:
-            # Only the average is negative; most indices actually rose.
-            base = (f"Bonds catch a bid while equity breadth stays positive "
-                    f"({stats['up']} of {stats['n']} indices higher, {eq_val}, "
-                    f"{y_val}) — a rates-led move rather than a broad flight to quality.")
-        else:
-            base = (f"Equities fall as bonds catch a bid ({eq_val}, {y_val}) — textbook "
-                    f"risk-off, flight-to-quality positioning.")
+        # Breadth is guaranteed non-positive here: a negative average with
+        # positive breadth is eq_mixed and was handled above.
+        base = (f"Equities fall as bonds catch a bid ({eq_val}, {y_val}) — textbook "
+                f"risk-off, flight-to-quality positioning.")
     elif eq_dir < 0 and bond_dir < 0:
         base = (f"Both equities and bonds are under pressure ({eq_val}, {y_val}) — "
                 f"rising yields into a stock selloff point to a rates-driven, "
@@ -611,14 +657,27 @@ def morning_briefing(rows):
         fx_text, fx_tone = ("Dollar mixed against majors — no clear FX-driven theme.", "neutral")
     bullets.append({"label": "FX", "text": fx_text, "tone": fx_tone})
 
-    # 5. Rates / curve
+    # 5. Rates / curve — the equity read comes from the 10Y's actual move, with
+    #    a dead-band, so "rising yields are a headwind" can only print on a day
+    #    the 10Y is genuinely higher. The level and the change are both quoted
+    #    so the claim is checkable against the number beside it.
     if curve["spread"] is None:
         rates_text, rates_tone = "Curve data unavailable.", "neutral"
     else:
-        yields_dir = _sign(_field(rows, "^TNX", "change_pct"))
-        rate_bias = ("rising yields are a headwind for equities" if yields_dir > 0
-                     else "easing yields offer relief to equities" if yields_dir < 0
-                     else "yields little changed")
+        yield_chg = _field(rows, "^TNX", "change_pct")
+        ten_y = curve["ten_y"]
+        level = f" at {ten_y:.2f}%" if ten_y is not None else ""
+        if yield_chg is None:
+            rate_bias = f"the 10Y{level} has no comparable prior close"
+        elif _dir(yield_chg, YIELD_FLAT_PCT) > 0:
+            rate_bias = (f"the 10Y is higher{level} ({_pct(yield_chg)}) — rising "
+                         f"yields are a headwind for equities")
+        elif _dir(yield_chg, YIELD_FLAT_PCT) < 0:
+            rate_bias = (f"the 10Y is lower{level} ({_pct(yield_chg)}) — easing "
+                         f"yields offer relief to equities")
+        else:
+            rate_bias = (f"the 10Y is little changed{level} ({_pct(yield_chg)}) — "
+                         f"no rates impulse for equities either way")
         rates_text = (f"2s10s at {curve['spread_bps']:+.0f}bps ({curve['label']}); "
                       f"{rate_bias}.")
         rates_tone = curve["tone"]
@@ -931,13 +990,17 @@ _NARRATIVE_RULES = [
      r"|equities are under pressure|stocks slip",
      "equities", lambda v: v < -FLAT_PCT,
      "the average index move must be meaningfully negative"),
-    (r"equities trade broadly flat|little changed|flat tape",
+    # Scoped to the equity subject: "little changed" on its own also describes
+    # the 10Y, which has its own rule below and its own dead-band.
+    (r"equities trade broadly flat|equities and bonds are little changed"
+     r"|flat tape",
      "equities", lambda v: abs(v) <= FLAT_PCT,
      "the average index move must be inside the flat band"),
 
     # A directional equity claim also needs breadth to agree with the average,
     # otherwise one outlier index is speaking for the whole complex.
-    (r"equities extend gains|equities trade lower|equities climb|equities fall",
+    (r"equities extend gains|equities trade lower|equities climb|equities fall"
+     r"|equities (?:and bonds )?are rallying",
      "eq_agreement", lambda v: v == 1.0,
      "breadth and the average must agree before calling a direction"),
     (r"equities are mixed", "eq_agreement", lambda v: v == 0.0,
@@ -946,10 +1009,21 @@ _NARRATIVE_RULES = [
      "breadth", lambda v: v <= 0,
      "equity breadth must not be positive to call it a broad flight to quality"),
 
-    (r"easing yields|yields ease|bonds catch a bid",
-     "yield_10y", lambda v: v < 0, "the 10Y yield must be falling"),
-    (r"rising yields|yields higher|bonds sell off",
-     "yield_10y", lambda v: v > 0, "the 10Y yield must be rising"),
+    # Yield direction. Dead-banded on both sides so a fractional-basis-point
+    # drift cannot licence "rising yields are a headwind for equities" — the
+    # templated phrase that used to print off a bare sign test.
+    (r"easing yields|yields ease|yields are easing|falling yields"
+     r"|the 10Y is lower|10Y lower|bonds catch a bid",
+     "yield_10y", lambda v: v < -YIELD_FLAT_PCT,
+     "the 10Y yield must be meaningfully lower"),
+    (r"rising yields|yields higher|yields are rising"
+     r"|the 10Y is higher|10Y higher|bonds sell off",
+     "yield_10y", lambda v: v > YIELD_FLAT_PCT,
+     "the 10Y yield must be meaningfully higher"),
+    (r"the 10Y is little changed|yields little changed|yields are flat"
+     r"|no rates impulse|bonds are little changed",
+     "yield_10y", lambda v: abs(v) <= YIELD_FLAT_PCT,
+     "the 10Y yield must be inside the flat band"),
 
     (r"subdued volatility|calm, risk-tolerant|hedges still cheap|options are cheap",
      "vix", lambda v: v < 20, "VIX must be below 20"),
@@ -1015,6 +1089,85 @@ def _format_metric(metric):
     return f"{value:+.0f}"
 
 
+# --------------------------------------------------------------------------- #
+# Structural check: regime-component lean groups
+# --------------------------------------------------------------------------- #
+# The regex rules above pair a *phrase* with a *metric*. Lean groups need a
+# different shape of check: the claim is "this named component leans this way",
+# and the number it must agree with is that component's own regime score. So we
+# find every "... lean(s) risk-on / risk-off" and "... read(s) neutral" clause,
+# see which component readings are named inside it, and hold each one to
+# COMPONENT_LEAN_AT.
+_LEAN_CLAUSE_RE = re.compile(
+    r"\blean(?:s)?\s+risk-(on|off)\b|\bread(?:s)?\s+neutral\b", re.IGNORECASE)
+
+# Clause separators. A component named on the far side of one belongs to a
+# different lean group, so each clause is examined on its own. A full stop only
+# ends a clause when whitespace or the end of the string follows it — component
+# readings are full of decimal points ("VIX 19.5", "gold +2.51%") and splitting
+# on those would hide the very claims this check exists to catch.
+_CLAUSE_SPLIT_RE = re.compile(r";|\.(?=\s|$)")
+
+
+def _lean_claim_issues(components, sections):
+    """Flag lean-group memberships that the component's own score contradicts.
+
+    Two failure modes, both of which shipped in the briefing:
+
+        * a component inside the neutral dead-band listed as leaning risk-on or
+          risk-off (VIX 19.5, score -0.13, printed as a risk-off driver), and
+        * a component listed on the wrong side of its own sign.
+
+    The mirror case is checked too: anything described as reading neutral must
+    actually be inside the band.
+
+    Returns (issues, claims_checked).
+    """
+    if not components:
+        return [], 0
+
+    issues, claims = [], 0
+    for source, text in sections:
+        for clause in _CLAUSE_SPLIT_RE.split(text):
+            match = _LEAN_CLAUSE_RE.search(clause)
+            if not match:
+                continue
+            side = (match.group(1) or "neutral").lower()
+            # Only the text *before* the verb names the group's members.
+            listed = clause[:match.start()]
+            for component in components:
+                if component["text"] not in listed:
+                    continue
+                claims += 1
+                score = component["score"]
+                leaning = abs(score) >= COMPONENT_LEAN_AT
+                if side == "neutral":
+                    ok, rule = (not leaning,
+                                f"a component may only read neutral while its "
+                                f"score is inside +/-{COMPONENT_LEAN_AT:.2f}")
+                elif not leaning:
+                    ok, rule = (False,
+                                f"a component inside the neutral dead-band "
+                                f"(+/-{COMPONENT_LEAN_AT:.2f}) must not be listed "
+                                f"as leaning risk-{side}")
+                else:
+                    ok, rule = ((score > 0) == (side == "on"),
+                                f"the component score must be "
+                                f"{'positive' if side == 'on' else 'negative'} "
+                                f"to lean risk-{side}")
+                if ok:
+                    continue
+                issues.append({
+                    "source": source,
+                    "phrase": f"{component['text']} {match.group(0)}",
+                    "metric": f"{component['label']} component score",
+                    "value": f"{score:+.2f}",
+                    "rule": rule,
+                    "text": text,
+                })
+    return issues, claims
+
+
 def narrative_sections(rows):
     """Every generated sentence in the briefing, tagged with its source."""
     brief = morning_briefing(rows)
@@ -1031,6 +1184,12 @@ def narrative_sections(rows):
 
 def consistency_check(rows, sections=None):
     """Cross-check every directional claim in the narrative against its metric.
+
+    Two passes run over every sentence:
+
+        1. the phrase/metric rules in ``_NARRATIVE_RULES``, and
+        2. :func:`_lean_claim_issues`, which holds each regime component named
+           in a lean group to its own score.
 
     Returns {issues, claims_checked, sections_checked}. Each issue is
     {source, phrase, metric, value, rule, text} — the sentence that made the
@@ -1061,6 +1220,12 @@ def consistency_check(rows, sections=None):
                     "rule": rule,
                     "text": text,
                 })
+
+    lean_issues, lean_claims = _lean_claim_issues(
+        market_regime(rows)["components"], sections)
+    issues.extend(lean_issues)
+    claims += lean_claims
+
     return {"issues": issues, "claims_checked": claims,
             "sections_checked": len(sections)}
 

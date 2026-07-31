@@ -169,6 +169,123 @@ def test_sections_present():
     check("count-up animation retained", 'class="num count"' in HTML)
 
 
+# --------------------------------------------------------------------------- #
+# 5. Dark terminal theme + WCAG AA contrast
+# --------------------------------------------------------------------------- #
+def _srgb(c):
+    c /= 255.0
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _lum(hexc):
+    hexc = hexc.lstrip("#")
+    r, g, b = (int(hexc[i:i + 2], 16) for i in (0, 2, 4))
+    return 0.2126 * _srgb(r) + 0.7152 * _srgb(g) + 0.0722 * _srgb(b)
+
+
+def contrast(fg, bg):
+    a, b = _lum(fg), _lum(bg)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+
+def _over(fg, bg, alpha):
+    """Composite fg over bg at *alpha* — badge tints are translucent."""
+    f, b = fg.lstrip("#"), bg.lstrip("#")
+    return "#" + "".join(
+        f"{round(int(f[i:i + 2], 16) * alpha + int(b[i:i + 2], 16) * (1 - alpha)):02x}"
+        for i in (0, 2, 4))
+
+
+AA = 4.5
+
+
+def test_dark_theme():
+    print("\n5. Dark terminal theme")
+
+    check("declares a dark colour-scheme",
+          '<meta name="color-scheme" content="dark">' in HTML)
+    check("page background is a vertical gradient between the dark stops",
+          "linear-gradient(180deg," in HTML
+          and report.PAGE_TOP in HTML and report.PAGE_BOT in HTML)
+    check("page background is deep navy-grey, not white",
+          _lum(report.PAGE_TOP) < 0.05, f"luminance {_lum(report.PAGE_TOP):.3f}")
+    check("cards are dark, not light on dark",
+          _lum(report.SURFACE) < 0.05, f"luminance {_lum(report.SURFACE):.3f}")
+    check("cards sit above the page, not below it",
+          _lum(report.SURFACE) > _lum(report.PAGE_TOP))
+    check("card text is light, not dark",
+          _lum(report.INK) > 0.7, f"luminance {_lum(report.INK):.3f}")
+    check("charts render on the card colour, not white",
+          report.CHART_BG == report.SURFACE)
+    check("no white page background survives in the stylesheet",
+          "background: var(--bg); color: var(--ink);" not in report._STYLES)
+
+    # Every text/background pair on the page must clear AA.
+    surfaces = [("page top", report.PAGE_TOP), ("page bottom", report.PAGE_BOT),
+                ("card", report.SURFACE), ("kpi tile", report.SURFACE_2),
+                ("masthead", report.NAVY)]
+    inks = [("ink", report.INK), ("body", report.INK_2),
+            ("muted", report.MUTED), ("micro-label", report.MUTED_2)]
+    signals = [("pos", report.POS), ("neg", report.NEG),
+               ("caution", report.AMBER), ("neutral", report.NEUTRAL)]
+
+    worst = (999.0, "")
+    for s_name, surface in surfaces:
+        for t_name, colour in inks + signals:
+            r = contrast(colour, surface)
+            if r < worst[0]:
+                worst = (r, f"{t_name} on {s_name}")
+            check(f"AA: {t_name} on {s_name}", r >= AA, f"{r:.2f}:1")
+
+    # Brand tags are lightened for the dark card; check them over their tint.
+    for name, colour in list(report.ASSET_COLOURS.items()) + \
+            list(report.SOURCE_COLOURS.items()):
+        tint = _over(colour, report.SURFACE, 0.12)
+        r = contrast(report._lighten(colour, 0.55), tint)
+        if r < worst[0]:
+            worst = (r, f"badge {name}")
+        check(f"AA: badge '{name}' on its tint", r >= AA, f"{r:.2f}:1")
+
+    # The notebook is the one deliberate light surface.
+    check("AA: notebook ink on cream paper (deliberate exception)",
+          contrast("#1f3a5f", "#fbf8f0") >= AA)
+    check("notebook keeps its cream paper", "#fbf8f0" in HTML)
+    check("notebook re-declares its own ink so it cannot inherit light text",
+          re.search(r"\.notebook \{[^}]*color: #33455f", report._STYLES) is not None)
+
+    print(f"      lowest contrast on the page: {worst[0]:.2f}:1 ({worst[1]})")
+    check("every pair clears AA with margin", worst[0] >= AA, f"{worst[0]:.2f}:1")
+
+
+# --------------------------------------------------------------------------- #
+# 6. News thumbnails and the placeholder tile
+# --------------------------------------------------------------------------- #
+def test_news_placeholder():
+    print("\n6. News placeholder tile")
+
+    check("a placeholder renders when no image is reachable",
+          'class="news-thumb news-thumb-ph"' in HTML)
+    check("the placeholder carries the source name",
+          re.search(r'news-thumb-ph"[^>]*>\s*<span>Reuters</span>', HTML) is not None)
+
+    # The old tile was a flat block of per-source brand colour, built inline.
+    check("no inline per-source gradient on the tile",
+          re.search(r'news-thumb-ph"\s+style=', HTML) is None)
+    check("the tile is not a flat orange block",
+          "#d97706" not in re.search(
+              r'\.news-thumb-ph \{[^}]*\}', report._STYLES).group(0))
+
+    rule = re.search(r"\.news-thumb-ph \{[^}]*\}", report._STYLES).group(0)
+    check("tile uses a subtle dark gradient", "linear-gradient" in rule)
+    check("tile has a thin border", "border: 1px solid" in rule)
+    span = re.search(r"\.news-thumb-ph span \{[^}]*\}", report._STYLES).group(0)
+    check("source name is small", re.search(r"font-size: 9(\.\d+)?px", span) is not None)
+    check("source name is refined uppercase",
+          "text-transform: uppercase" in span and "letter-spacing" in span)
+    check("tile styling is source-independent (one treatment for all)",
+          "Reuters" not in rule and "BBC" not in rule)
+
+
 def main():
     print("=" * 70)
     print(" REPORT RENDERER TESTS")
@@ -177,6 +294,8 @@ def main():
     test_bullet_content()
     test_design_system()
     test_sections_present()
+    test_dark_theme()
+    test_news_placeholder()
 
     print("\n" + "=" * 70)
     print(f" {len(PASSED)} passed, {len(FAILED)} failed")

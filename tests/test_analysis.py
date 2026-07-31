@@ -125,6 +125,39 @@ def test_outlier_index():
     check("correlation note does not assert flight-to-quality on positive breadth",
           "textbook risk-off" not in corr
           and "rather than a broad flight to quality" in corr, corr)
+
+    # The mirror case, caught on live 2026-07-31 data: Nikkei +4.03% against
+    # four small decliners lifts the average to +0.64% while 4 of 5 indices are
+    # LOWER. The note claimed "Equities climb ... a classic reflationary,
+    # risk-on configuration" — contradicting the four.
+    # NB: bound to its own names — `rows`/`stats`/`corr` are reused by the
+    # assertions further down this function.
+    print("      -- outlier carries the mean the other way --")
+    up_rows = make_rows(spx=-0.21, stoxx=-0.08, nikkei=4.03, ftse=-0.42,
+                        dax=-0.13, tnx_chg=1.50)
+    up_stats = analysis._equity_stats(up_rows)
+    up_corr = analysis.correlation_note(up_rows)
+    print(f"      avg {up_stats['mean']:+.2f}%, {up_stats['up']} of "
+          f"{up_stats['n']} higher, breadth {up_stats['breadth']:+.2f}")
+    print(f"      -> {up_corr}")
+    check("positive average with negative breadth is not called a climb",
+          "Equities climb" not in up_corr, up_corr)
+    check("nor a reflationary risk-on configuration",
+          "reflationary" not in up_corr, up_corr)
+    check("it is described as mixed", "Equities are mixed" in up_corr, up_corr)
+    check("breadth is quoted alongside the average",
+          "1 of 5 indices higher" in up_corr, up_corr)
+    up_res = analysis.consistency_check(up_rows)
+    for issue in up_res["issues"]:
+        print(f"        ! {issue['source']}: \"{issue['phrase']}\" vs "
+              f"{issue['metric']} = {issue['value']}")
+    check("outlier-carried-mean narrative is self-consistent", not up_res["issues"])
+    check("checker rejects the old wording on this data",
+          "breadth/average agreement" in
+          {i["metric"] for i in analysis.consistency_check(
+              up_rows, sections=[("planted",
+                                  "Equities climb while bonds sell off — a classic "
+                                  "reflationary, risk-on configuration.")])["issues"]})
     res = analysis.consistency_check(rows)
     for issue in res["issues"]:
         print(f"        ! {issue['source']}: \"{issue['phrase']}\" vs "
@@ -409,6 +442,133 @@ def test_missing_data():
     check("empty input returns no score", empty["score"] is None)
 
 
+# --------------------------------------------------------------------------- #
+# 9. A neutral component is never listed as a lean
+# --------------------------------------------------------------------------- #
+def test_neutral_components_never_lean():
+    """The reported bug: 'gold +2.51% and vix 19.5 lean risk-off' printed on a
+    page whose Volatility line called the same VIX 'a calm, risk-tolerant tape'.
+    VIX 19.5 scores -0.13 — inside the dead-band — so it is neutral, and a
+    neutral component may not appear in either lean group."""
+    print("\n9. Neutral components are described as neutral, never as a lean")
+    rows = make_rows(vix=19.5, gold=2.51)
+    regime = analysis.market_regime(rows)
+    detail = regime["detail"]
+    vix_c = next(c for c in regime["components"] if c["key"] == "vix")
+    print(f"      VIX component score {vix_c['score']:+.3f} "
+          f"(band +/-{analysis.COMPONENT_LEAN_AT:.2f})")
+    print(f"      -> {detail}")
+
+    check("VIX 19.5 scores inside the neutral dead-band",
+          abs(vix_c["score"]) < analysis.COMPONENT_LEAN_AT, f"{vix_c['score']:+.3f}")
+    risk_off_clause = next((c for c in detail.split(";") if "risk-off" in c), "")
+    risk_on_clause = next((c for c in detail.split(";") if "risk-on" in c), "")
+    check("VIX is absent from the risk-off lean group",
+          "VIX" not in risk_off_clause, risk_off_clause)
+    check("VIX is absent from the risk-on lean group",
+          "VIX" not in risk_on_clause, risk_on_clause)
+    check("VIX is described as reading neutral",
+          "VIX 19.5 reads neutral" in detail, detail)
+    check("case is preserved (capitalize() no longer flattens 'VIX')",
+          "vix 19.5" not in detail, detail)
+    check("the genuine drags are still named",
+          "gold +2.51%" in risk_off_clause, risk_off_clause)
+
+    # The Sentiment line and the Volatility line must agree about the same VIX.
+    brief = analysis.morning_briefing(rows)
+    vol = next(b["text"] for b in brief["bullets"] if b["label"] == "Volatility")
+    sent = next(b["text"] for b in brief["bullets"] if b["label"] == "Sentiment")
+    check("Volatility line calls VIX 19.5 a calm tape", "calm" in vol, vol)
+    check("Sentiment line does not contradict it",
+          "VIX 19.5 reads neutral" in sent, sent)
+    check("whole briefing is self-consistent",
+          not analysis.consistency_check(rows)["issues"])
+
+    # The checker must reject every dishonest lean-group phrasing on this data.
+    for text, expect in [
+        ("gold +2.51% and VIX 19.5 lean risk-off.", "VIX component score"),
+        ("VIX 19.5 leans risk-on.", "VIX component score"),
+        ("gold +2.51% leans risk-on.", "Gold component score"),
+        ("gold +2.51% reads neutral.", "Gold component score"),
+        ("gold +2.51% and dollar broadly firmer lean risk-off.", None),
+        ("VIX 19.5 reads neutral.", None),
+    ]:
+        res = analysis.consistency_check(rows, sections=[("planted", text)])
+        found = {i["metric"] for i in res["issues"]}
+        if expect is None:
+            check(f"lean check allows: {text[:44]}", not res["issues"], str(found))
+        else:
+            check(f"lean check rejects: {text[:44]}", expect in found, str(found))
+
+    # A component sitting just outside the band must still be reported as a
+    # lean — the dead-band must not silence real signals.
+    strong = analysis.market_regime(make_rows(vix=24.0))
+    vix_c = next(c for c in strong["components"] if c["key"] == "vix")
+    check("VIX 24 (score -0.50) is still named as a risk-off drag",
+          abs(vix_c["score"]) >= analysis.COMPONENT_LEAN_AT
+          and "VIX 24.0" in strong["detail"].split(";")[-1] + strong["detail"],
+          strong["detail"])
+
+
+# --------------------------------------------------------------------------- #
+# 10. The Rates line reads the actual 10Y move
+# --------------------------------------------------------------------------- #
+def test_rates_line():
+    """'rising yields are a headwind for equities' used to be selected off a
+    bare sign test, so it printed on any positive change — including a
+    fractional-basis-point drift — and on days the 10Y was flat."""
+    print("\n10. Rates commentary follows the actual 10Y change")
+
+    def rates_of(rows):
+        return next(b["text"] for b in analysis.morning_briefing(rows)["bullets"]
+                    if b["label"] == "Rates")
+
+    falling = rates_of(make_rows(tnx_chg=-0.80))
+    rising = rates_of(make_rows(tnx_chg=0.90))
+    drift = rates_of(make_rows(tnx_chg=0.02))
+    flat = rates_of(make_rows(tnx_chg=0.0))
+    for text in (falling, rising, drift, flat):
+        print(f"      {text}")
+
+    check("falling 10Y does not claim rising yields",
+          "rising yields" not in falling, falling)
+    check("falling 10Y says yields are easing",
+          "easing yields" in falling and "the 10Y is lower" in falling, falling)
+    check("rising 10Y says rising yields", "rising yields" in rising, rising)
+    check("a +0.02% drift is not called rising",
+          "rising yields" not in drift and "little changed" in drift, drift)
+    check("an unchanged 10Y is not called rising or easing",
+          "rising yields" not in flat and "easing yields" not in flat, flat)
+    check("the Rates line quotes the 10Y level and its change",
+          "4.60%" in falling and "-0.80%" in falling, falling)
+    check("the curve reading is still carried",
+          all("2s10s at +54bps (Normal)" in t for t in (falling, rising, drift)))
+
+    # Every one of those days must survive the checker.
+    for chg in (-1.50, -0.80, -0.06, -0.04, 0.0, 0.03, 0.20, 1.10):
+        rows = make_rows(tnx_chg=chg)
+        res = analysis.consistency_check(rows)
+        for issue in res["issues"]:
+            print(f"        ! 10Y {chg:+.2f}%: \"{issue['phrase']}\" vs "
+                  f"{issue['metric']} = {issue['value']}")
+        check(f"10Y {chg:+.2f}% narrative is self-consistent", not res["issues"])
+
+    # And the checker must catch a yield claim that disagrees with the number.
+    rows = make_rows(tnx_chg=-0.80)
+    for text, expect in [
+        ("Rising yields are a headwind for equities.", "10Y yield change"),
+        ("The 10Y is little changed at 4.60%.", "10Y yield change"),
+        ("Bonds sell off as yields push higher.", "10Y yield change"),
+        ("The 10Y is lower at 4.60%.", None),
+    ]:
+        res = analysis.consistency_check(rows, sections=[("planted", text)])
+        found = {i["metric"] for i in res["issues"]}
+        if expect is None:
+            check(f"yield check allows: {text[:44]}", not res["issues"], str(found))
+        else:
+            check(f"yield check rejects: {text[:44]}", expect in found, str(found))
+
+
 def main():
     print("=" * 70)
     print(" ANALYSIS TESTS — regime classifier + narrative consistency")
@@ -421,6 +581,8 @@ def main():
     test_checker_catches_the_original_bug()
     test_sp_levels()
     test_missing_data()
+    test_neutral_components_never_lean()
+    test_rates_line()
 
     print("\n" + "=" * 70)
     print(f" {len(PASSED)} passed, {len(FAILED)} failed")
