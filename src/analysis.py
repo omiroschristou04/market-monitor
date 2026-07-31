@@ -124,7 +124,29 @@ COMPONENT_LEAN_AT = 0.20
 # yield is a fraction of a basis point and must not read as rising yields.
 YIELD_FLAT_PCT = 0.05
 
+# A one-day VIX move at or beyond this is a meaningful spike. The regime label
+# reads off the *level* and stays Normal below 20, which is correct — but the
+# prose describes the *day*, and a tape that jumped +8.4% is not "calm" just
+# because it landed at 18.5. Above this threshold the volatility copy
+# acknowledges the move; the level wording is unchanged.
+VIX_SPIKE_PCT = 5.0
+
+# Every VIX level printed anywhere in the briefing uses this many decimals.
+# The decision framework and the notebook used to round to whole points, so
+# one tape read "VIX 18.5" in the masthead and "VIX at 19" three sections down.
+VIX_DP = 1
+
 FX_PAIRS = ("EURUSD=X", "GBPUSD=X", "JPY=X")
+
+
+def _vix_str(vix):
+    """The one VIX rendering used by every section. See :data:`VIX_DP`."""
+    return "n/a" if vix is None else f"{vix:.{VIX_DP}f}"
+
+
+def _vix_spiking(vix_chg):
+    """True when the day's VIX move is a genuine spike, not noise."""
+    return vix_chg is not None and vix_chg >= VIX_SPIKE_PCT
 
 
 def _equity_stats(rows):
@@ -260,7 +282,7 @@ def market_regime(rows):
 
     specs = [
         ("vix", "VIX", _vix_component(vix),
-         f"VIX {vix:.1f}" if vix is not None else "VIX n/a"),
+         f"VIX {_vix_str(vix)}" if vix is not None else "VIX n/a"),
         ("curve", "2s10s", _curve_component(curve["spread_bps"]),
          f"2s10s {curve['spread_bps']:+.0f}bps"
          if curve["spread_bps"] is not None else "curve n/a"),
@@ -537,6 +559,7 @@ def morning_briefing(rows):
     regime = market_regime(rows)
     curve = yield_curve(rows)
     vix = _field(rows, "^VIX", "price")
+    vix_chg = _field(rows, "^VIX", "change_pct")
     stats = _equity_stats(rows)
     avg_eq = stats["mean"] if stats else None
     best = stats["best"] if stats else None
@@ -570,12 +593,18 @@ def morning_briefing(rows):
 
     eq_phrase, eq_shape = _equity_phrase(stats)
 
+    # The level word and the day's move are two separate readings, and both
+    # belong here: a VIX that jumped +8% into 18.5 is still a low level, but
+    # calling that tape calm ignores the move that got it there.
     if vix is None:
         vol_phrase = "volatility data is thin"
+    elif _vix_spiking(vix_chg) and vix < 20:
+        vol_phrase = (f"a still-low VIX at {_vix_str(vix)} ticking up from a "
+                      f"low base ({_pct(vix_chg)})")
     else:
         vol_word = ("subdued" if vix < 20 else
                     "above-average" if vix < 30 else "elevated")
-        vol_phrase = f"a {vol_word} VIX at {vix:.1f}"
+        vol_phrase = f"a {vol_word} VIX at {_vix_str(vix)}"
     s1 = f"{lead} as {eq_phrase} and {vol_phrase} frames the tape."
 
     # Sentence 2 states price and the 52-week high as separate, labelled
@@ -637,15 +666,23 @@ def morning_briefing(rows):
         eq_text, eq_tone = "Equity data unavailable.", "neutral"
     bullets.append({"label": "Equities", "text": eq_text, "tone": eq_tone})
 
-    # 3. VIX regime
+    # 3. VIX regime — the level sets the band, the day's move qualifies it.
+    #    Reading the level alone printed "subdued volatility signals a calm
+    #    tape" on a session the VIX rose +8.37%; the level was honest, the
+    #    word "calm" was not. Both readings are now quoted together.
+    spiking = _vix_spiking(vix_chg)
+    move = f" ({_pct(vix_chg)} on the day)" if vix_chg is not None else ""
     if vix is None:
         vix_text, vix_tone = "VIX data unavailable.", "neutral"
     elif vix >= 30:
-        vix_text, vix_tone = (f"VIX {vix:.1f} — elevated volatility; expect outsized swings and hedge demand.", "neg")
+        vix_text, vix_tone = (f"VIX {_vix_str(vix)}{move} — elevated volatility; expect outsized swings and hedge demand.", "neg")
     elif vix >= 20:
-        vix_text, vix_tone = (f"VIX {vix:.1f} — above-average volatility; markets are nervous but not panicked.", "caution")
+        vix_text, vix_tone = (f"VIX {_vix_str(vix)}{move} — above-average volatility; markets are nervous but not panicked.", "caution")
+    elif spiking:
+        vix_text, vix_tone = (f"VIX {_vix_str(vix)}{move} — the absolute level is still low, but volatility is "
+                              f"ticking up from a low base; the tape is quieter than it is settled.", "caution")
     else:
-        vix_text, vix_tone = (f"VIX {vix:.1f} — subdued volatility signals a calm, risk-tolerant tape.", "pos")
+        vix_text, vix_tone = (f"VIX {_vix_str(vix)}{move} — subdued volatility signals a calm, risk-tolerant tape.", "pos")
     bullets.append({"label": "Volatility", "text": vix_text, "tone": vix_tone})
 
     # 4. FX / USD — use the same label as the opening paragraph for consistency.
@@ -702,10 +739,12 @@ def morning_briefing(rows):
         watch = "Watch the inverted curve — any further inversion reinforces recession pricing."
         watch_tone = "neg"
     elif kl and kl["near_high"]:
-        # Name both levels explicitly — the high is the target, not the price.
-        watch = (f"Watch the S&P 500 52-week high at {kl['high']:,.0f}, "
-                 f"{abs(kl['pct_from_high']):.1f}% above spot at {kl['price']:,.0f}; "
-                 f"a clean break opens upside.")
+        # Both levels are named, and the sentence says which sits above which.
+        # "2.4% above spot at 7,429" left the percentage attachable to either
+        # number; spelling the relationship out removes the ambiguity.
+        watch = (f"Watch the S&P 500: the 52-week high of {kl['high']:,.0f} sits "
+                 f"{abs(kl['pct_from_high']):.1f}% above the current price of "
+                 f"{kl['price']:,.0f}; a clean break opens upside.")
         watch_tone = "pos"
     elif vix is not None and vix >= 20:
         watch = "Watch volatility — a VIX move above 25 would confirm a risk-off shift."
@@ -729,6 +768,7 @@ def analyst_notebook(rows):
     """
     notes = []
     vix = _field(rows, "^VIX", "price")
+    vix_chg = _field(rows, "^VIX", "change_pct")
     curve = yield_curve(rows)
     kl = key_levels(rows)
     gold_chg = _field(rows, "GC=F", "change_pct")
@@ -746,16 +786,20 @@ def analyst_notebook(rows):
     elif kl:
         notes.append(f"S&P mid-range at {kl['price']:,.0f} — no level urgency, let it come to me")
 
-    # 2. VIX read
+    # 2. VIX read — level first, but a sharp daily move overrides the "calm"
+    #    shorthand even while the level itself is still low.
     if vix is not None:
-        if vix < 15:
-            notes.append(f"VIX {vix:.0f} = complacency? Check if vol is being suppressed")
+        if _vix_spiking(vix_chg) and vix < 20:
+            notes.append(f"VIX {_vix_str(vix)} ({_pct(vix_chg)}) — low level but ticking up "
+                         f"from a low base, don't get complacent on hedges")
+        elif vix < 15:
+            notes.append(f"VIX {_vix_str(vix)} = complacency? Check if vol is being suppressed")
         elif vix < 20:
-            notes.append(f"VIX {vix:.0f} — calm but not euphoric, hedges still cheap")
+            notes.append(f"VIX {_vix_str(vix)} — calm but not euphoric, hedges still cheap")
         elif vix < 30:
-            notes.append(f"VIX {vix:.0f} — nerves building, size down and respect stops")
+            notes.append(f"VIX {_vix_str(vix)} — nerves building, size down and respect stops")
         else:
-            notes.append(f"VIX {vix:.0f} = stress! Don't catch falling knives, wait for capitulation")
+            notes.append(f"VIX {_vix_str(vix)} = stress! Don't catch falling knives, wait for capitulation")
 
     # 3. Curve
     if curve["spread_bps"] is not None:
@@ -814,6 +858,7 @@ def decision_framework(rows):
     would shape an analyst's actual positioning decisions."""
     points = []
     vix = _field(rows, "^VIX", "price")
+    vix_chg = _field(rows, "^VIX", "change_pct")
     curve = yield_curve(rows)
     kl = key_levels(rows)
     gold_chg = _field(rows, "GC=F", "change_pct")
@@ -822,19 +867,26 @@ def decision_framework(rows):
     usd_score, usd_label = _usd_read(rows)
     btc = _get(rows, "BTC-USD")
 
-    # 1. Volatility -> options vs stock
+    # 1. Volatility -> options vs stock. Levels print at VIX_DP decimals like
+    #    every other section; rounding to whole points here is what produced
+    #    "VIX at 19" on a page whose masthead said 18.5.
     if vix is not None:
-        if vix < 18:
+        if _vix_spiking(vix_chg) and vix < 18:
+            points.append({"icon": "📈", "title": "Cheap optionality, but bid",
+                           "text": f"VIX at {_vix_str(vix)} ({_pct(vix_chg)}) still leaves options inexpensive in "
+                                   f"absolute terms, but premium is being marked up from a low base — if I want "
+                                   f"that optionality I buy it now rather than wait for a better price."})
+        elif vix < 18:
             points.append({"icon": "📉", "title": "Cheap optionality",
-                           "text": f"VIX at {vix:.0f} tells me options are cheap — if I had conviction on a "
+                           "text": f"VIX at {_vix_str(vix)} tells me options are cheap — if I had conviction on a "
                                    f"trade I'd buy calls rather than stock for better risk/reward."})
         elif vix < 30:
             points.append({"icon": "📈", "title": "Vol picking up",
-                           "text": f"VIX at {vix:.0f} means premium is no longer a giveaway — I lean toward "
+                           "text": f"VIX at {_vix_str(vix)} means premium is no longer a giveaway — I lean toward "
                                    f"spreads over outright options and tighten position sizing."})
         else:
             points.append({"icon": "⚠️", "title": "Stressed vol",
-                           "text": f"VIX at {vix:.0f} is expensive and jumpy — I sell premium only in defined-risk "
+                           "text": f"VIX at {_vix_str(vix)} is expensive and jumpy — I sell premium only in defined-risk "
                                    f"structures and hold extra cash for dislocation."})
 
     # 2. Curve -> equity stance
@@ -951,6 +1003,8 @@ def _check_metrics(rows):
                       "name": "10Y yield change"},
         "vix":       {"value": _field(rows, "^VIX", "price"), "unit": "level",
                       "name": "VIX"},
+        "vix_1d":    {"value": _field(rows, "^VIX", "change_pct"), "unit": "pct",
+                      "name": "VIX 1-day change"},
         "curve_bps": {"value": curve["spread_bps"], "unit": "bps",
                       "name": "2s10s spread"},
         "usd":       {"value": float(usd_raw), "unit": "score",
@@ -1031,6 +1085,18 @@ _NARRATIVE_RULES = [
      "vix", lambda v: 20 <= v < 30, "VIX must be between 20 and 30"),
     (r"elevated volatility|acute market stress|stress!",
      "vix", lambda v: v >= 30, "VIX must be at or above 30"),
+
+    # The VIX *level* rules above say nothing about the day's move, which is a
+    # separate claim: a +8.37% session that closes at 18.5 is a low level and a
+    # sharp move at the same time. These two rules hold each half of the
+    # volatility copy to the number it actually describes.
+    (r"from a low base|marked up from a low base",
+     "vix_1d", lambda v: v >= VIX_SPIKE_PCT,
+     f"the 1-day VIX change must be at or above {VIX_SPIKE_PCT:+.0f}% to call "
+     f"volatility rising off a low base"),
+    (r"calm, risk-tolerant|calm but not euphoric|calm tape",
+     "vix_1d", lambda v: v < VIX_SPIKE_PCT,
+     f"a VIX day at or above {VIX_SPIKE_PCT:+.0f}% must not be described as calm"),
 
     (r"inverted|inversion", "curve_bps", lambda v: v < 0,
      "the 2s10s spread must be negative"),

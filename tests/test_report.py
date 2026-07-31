@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -54,14 +55,40 @@ HEADLINES = [
 ]
 
 
-def render():
+def _dated(hour, minute, source, title):
+    """A headline carrying a real UTC publish time, as the feeds produce."""
+    published = datetime(2026, 7, 31, hour, minute, tzinfo=timezone.utc)
+    return {"source": source, "title": title, "url": "https://example.com/x",
+            "published": published,
+            "published_str": published.strftime("%H:%M UTC"),
+            # Deliberately stale/wrong — the renderer must recompute these.
+            "relative": "99m ago", "image": None}
+
+
+# The ten items the live report published, in the order it published them:
+# five Reuters, then five BBC, with two BBC items newer than Reuters ones above.
+DATED_HEADLINES = [
+    _dated(14, 4, "Reuters", "Reuters 14:04"),
+    _dated(13, 42, "Reuters", "Reuters 13:42"),
+    _dated(13, 41, "Reuters", "Reuters 13:41"),
+    _dated(12, 57, "Reuters", "Reuters 12:57"),
+    _dated(12, 51, "Reuters", "Reuters 12:51"),
+    _dated(13, 27, "BBC Business", "BBC 13:27"),
+    _dated(13, 16, "BBC Business", "BBC 13:16"),
+    _dated(12, 42, "BBC Business", "BBC 12:42"),
+    _dated(12, 19, "BBC Business", "BBC 12:19"),
+    _dated(11, 19, "BBC Business", "BBC 11:19"),
+]
+
+
+def render(headlines=HEADLINES, rows=None):
     """Render a full report from the standard fixture and return its HTML."""
-    rows = make_rows()
+    rows = rows if rows is not None else make_rows()
     for r in rows:                      # give the trend charts something to draw
         r["history"] = [(f"2026-07-{d:02d}", (r["price"] or 100.0) * (1 + d / 500.0))
                         for d in range(1, 29)]
     with tempfile.TemporaryDirectory() as tmp:
-        path = report.generate_report(rows, headlines=HEADLINES, reports_dir=tmp)
+        path = report.generate_report(rows, headlines=headlines, reports_dir=tmp)
         with open(path, encoding="utf-8") as f:
             return f.read()
 
@@ -286,6 +313,183 @@ def test_news_placeholder():
           "Reuters" not in rule and "BBC" not in rule)
 
 
+# --------------------------------------------------------------------------- #
+# 7. Headlines render strictly newest-first, with labels that reconcile
+# --------------------------------------------------------------------------- #
+def _rendered_news(html_text):
+    """Every headline's (relative label, UTC stamp, title) in render order."""
+    out = []
+    for block in re.finditer(
+            r'news-time">(.*?)</span>.*?news-title"[^>]*>(.*?)</a>',
+            html_text, re.S):
+        meta = " ".join(block.group(1).split())
+        label, _, stamp = meta.partition("&middot;")
+        out.append((label.strip(), stamp.strip(), block.group(2).strip()))
+    return out
+
+
+def test_news_ordering_and_times():
+    print("\n7. Headlines: cross-source ordering and UTC labels")
+
+    html_text = render(headlines=DATED_HEADLINES)
+    items = _rendered_news(html_text)
+    for label, stamp, title in items:
+        print(f"      {stamp:<12} {label:<10} {title}")
+
+    check("every headline renders", len(items) == len(DATED_HEADLINES),
+          f"{len(items)} of {len(DATED_HEADLINES)}")
+
+    stamps = [stamp for _, stamp, _ in items]
+    check("stamps are strictly newest-first",
+          stamps == sorted(stamps, reverse=True), str(stamps))
+    check("the 13:27 BBC item renders above the 12:57 Reuters one",
+          stamps.index("13:27 UTC") < stamps.index("12:57 UTC"), str(stamps))
+    check("the 13:16 BBC item renders above the 12:57 Reuters one",
+          stamps.index("13:16 UTC") < stamps.index("12:57 UTC"), str(stamps))
+    check("sources are not grouped into blocks",
+          sum(1 for i in range(len(items) - 1)
+              if items[i][2].split()[0] != items[i + 1][2].split()[0]) > 1)
+
+    # The renderer must overwrite the stale labels the fixture carries.
+    check("stale fetch-time labels are recomputed",
+          not any(label == "99m ago" for label, _, _ in items),
+          str([l for l, _, _ in items]))
+
+    # Every label must reconcile with its stamp and the page's own clock.
+    generated = re.search(r"Generated <span class=\"num\">([^<]*)</span>",
+                          html_text).group(1)
+    print(f"      page generated: {generated}")
+    check("the generation stamp is labelled UTC", generated.endswith(" UTC"),
+          generated)
+    rendered_at = datetime.strptime(generated, "%Y-%m-%d %H:%M:%S UTC").replace(
+        tzinfo=timezone.utc)
+
+    bad = []
+    for (label, stamp, title), source in zip(items, report.news.sort_by_published(
+            DATED_HEADLINES)):
+        expected = report.news._relative_time(source["published"], rendered_at)
+        if label != expected:
+            bad.append(f"{stamp}: {label} != {expected}")
+        if stamp != source["published"].strftime("%H:%M UTC"):
+            bad.append(f"stamp mismatch at {title}")
+    check("every label reconciles with its stamp and the page clock",
+          not bad, "; ".join(bad))
+
+    # The specific contradiction from the live report: a 14:04 UTC story cannot
+    # read "25m ago" on a page generated at 17:30 with no timezone on it.
+    offset = (rendered_at - DATED_HEADLINES[0]["published"]).total_seconds() / 60
+    check("the newest label matches the real elapsed UTC minutes",
+          items[0][0] == report.news._relative_time(
+              DATED_HEADLINES[0]["published"], rendered_at),
+          f"{items[0][0]} vs {offset:.0f} minutes elapsed")
+
+
+# --------------------------------------------------------------------------- #
+# 8. One clock for the whole page, and it says UTC
+# --------------------------------------------------------------------------- #
+def test_utc_timestamps():
+    print("\n8. Page timestamps are UTC and labelled")
+
+    masthead = re.search(r'class="date">([^<]*)</div>', HTML).group(1)
+    clock = re.search(r'id="clock">([^<]*)</span>', HTML).group(1)
+    generated = re.search(r"Generated <span class=\"num\">([^<]*)</span>",
+                          HTML).group(1)
+    print(f"      masthead:  {masthead}")
+    print(f"      clock:     {clock}")
+    print(f"      generated: {generated}")
+
+    check("the masthead time is labelled UTC", masthead.rstrip().endswith("UTC"),
+          masthead)
+    check("the live clock is labelled UTC", clock.endswith(" UTC"), clock)
+    check("the footer stamp is labelled UTC", generated.endswith(" UTC"), generated)
+
+    # All three must be the same instant, not three different clocks.
+    stamp = datetime.strptime(generated, "%Y-%m-%d %H:%M:%S UTC")
+    check("the masthead and footer agree to the minute",
+          stamp.strftime("%H:%M UTC") in masthead,
+          f"{masthead} vs {generated}")
+    check("the live clock and footer agree to the second",
+          clock == stamp.strftime("%H:%M:%S UTC"), f"{clock} vs {generated}")
+
+    # And the page must be rendering in UTC, not local wall time.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    check("the stamp is the current UTC time, not local wall time",
+          abs((now - stamp).total_seconds()) < 120,
+          f"{stamp} vs UTC now {now}")
+
+    # The ticking clock must not fall back to the viewer's local timezone.
+    check("the clock script reads UTC, not toLocaleTimeString",
+          "toLocaleTimeString" not in HTML and "toISOString" in HTML)
+
+
+# --------------------------------------------------------------------------- #
+# 9. An uncomputable horizon renders as n/a, never as +0.00%
+# --------------------------------------------------------------------------- #
+def test_na_cells():
+    print("\n9. Unavailable horizons render as n/a")
+
+    check("a None percentage renders n/a", "n/a" in report._fmt_pct(None),
+          report._fmt_pct(None))
+    check("n/a is not styled as a movement",
+          "color:" not in report._fmt_pct(None) and "muted-cell" in report._fmt_pct(None))
+    check("n/a carries no direction arrow", "9650" not in report._fmt_pct(None)
+          and "9660" not in report._fmt_pct(None))
+    check("a real zero is still shown as +0.00%", "+0.00%" in report._fmt_pct(0.0))
+    check("n/a is not an em-dash", "&mdash;" not in report._fmt_pct(None))
+
+    # A 2Y row whose 1-month horizon could not be computed, as the guard in
+    # fetch now returns it.
+    rows = make_rows()
+    for r in rows:
+        if r["ticker"] == "2YY=F":
+            r["price"] = 4.130
+            r["change_pct"] = 1.08
+            r["week_change_pct"] = 2.35
+            r["month_change_pct"] = None      # the stale reference bar
+            r["ytd_change_pct"] = 22.23
+            r["52w_high"], r["52w_low"] = 4.130, 3.376
+    html_text = render(rows=rows)
+
+    row = re.search(r"<tr>(?:(?!</tr>).)*2YY=F.*?</tr>", html_text, re.S).group(0)
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+    values = [" ".join(re.sub(r"<[^>]+>", " ", c).split()) for c in cells]
+    print(f"      2Y row: {values}")
+
+    check("the 2Y row shows n/a for the month it cannot compute",
+          any(v == "n/a" for v in values), str(values))
+    check("the 2Y row no longer prints a misleading +0.00%",
+          not any("0.00%" in v for v in values), str(values))
+    check("the horizons that are measurable are still shown",
+          any("1.08%" in v for v in values) and any("2.35%" in v for v in values)
+          and any("22.23%" in v for v in values), str(values))
+    check("only the uncomputable horizon is blanked",
+          sum(1 for v in values if v == "n/a") == 1, str(values))
+
+
+# --------------------------------------------------------------------------- #
+# 10. One VIX rounding on the page, masthead included
+# --------------------------------------------------------------------------- #
+def test_masthead_vix():
+    print("\n10. The masthead quotes VIX like every other section")
+
+    html_text = render(rows=make_rows(vix=18.52))
+    strip = re.search(r'class="mast-vix">(.*?)</div>', html_text, re.S).group(1)
+    strip = " ".join(re.sub(r"<[^>]+>", " ", strip).split())
+    print(f"      masthead: {strip}")
+
+    check("the masthead quotes one decimal place", "18.5" in strip, strip)
+    check("the masthead does not quote two decimals", "18.52" not in strip, strip)
+    check("the masthead still carries the volatility regime",
+          "NORMAL" in strip, strip)
+
+    # No VIX level anywhere on the page may use a different rounding.
+    levels = set(re.findall(r"VIX(?:\s+Regime\s+\w+\s+&middot;)?\s*(?:at\s*)?"
+                            r"(\d+\.\d+)", re.sub(r"<[^>]+>", " ", html_text)))
+    check("every VIX level on the page reads 18.5", levels == {"18.5"}, str(levels))
+    check("the report and the analysis agree on the format",
+          report.analysis._vix_str(18.52) == "18.5")
+
+
 def main():
     print("=" * 70)
     print(" REPORT RENDERER TESTS")
@@ -296,6 +500,10 @@ def main():
     test_sections_present()
     test_dark_theme()
     test_news_placeholder()
+    test_news_ordering_and_times()
+    test_utc_timestamps()
+    test_na_cells()
+    test_masthead_vix()
 
     print("\n" + "=" * 70)
     print(f" {len(PASSED)} passed, {len(FAILED)} failed")

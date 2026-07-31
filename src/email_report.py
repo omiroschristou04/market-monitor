@@ -135,7 +135,9 @@ def _plain_text_fallback(report_date, regime, vix_value, bullets, report_url):
         lines.append(f"Market Regime: {regime['label']}")
     if vix_value is not None:
         vix_label, _ = _vix_regime(vix_value)
-        lines.append(f"VIX: {vix_value:.2f} ({vix_label})")
+        # Same one-decimal rendering the report uses, so the email and the
+        # briefing it links to never quote the same level two ways.
+        lines.append(f"VIX: {analysis._vix_str(vix_value)} ({vix_label})")
     lines.append("")
     for b in bullets or []:
         lines.append(f"- {b['label']}: {b['text']}")
@@ -176,7 +178,8 @@ def _build_email_html(report_date, regime, vix_value, bullets, report_url):
     regime_label = html.escape(regime["label"]) if regime else "Unknown"
 
     vix_label, vix_colour = _vix_regime(vix_value)
-    vix_display = f"{vix_value:.2f}" if vix_value is not None else "&mdash;"
+    vix_display = (analysis._vix_str(vix_value) if vix_value is not None
+                   else "&mdash;")
 
     return f"""<!DOCTYPE html>
 <html lang="en">

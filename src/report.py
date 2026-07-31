@@ -33,14 +33,14 @@ import base64
 import html
 import io
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import matplotlib
 
 matplotlib.use("Agg")  # headless backend, no display required
 import matplotlib.pyplot as plt  # noqa: E402
 
-from . import analysis  # noqa: E402
+from . import analysis, news  # noqa: E402
 from .config import ASSET_CLASS_ORDER, REPORTS_DIR  # noqa: E402
 
 # Asset classes for which a 30-day trend chart is drawn.
@@ -172,9 +172,16 @@ def _rgba(hex_colour, alpha):
 
 
 def _fmt_pct(value):
-    """A signed percentage in monospace, tinted by direction."""
+    """A signed percentage in monospace, tinted by direction.
+
+    ``None`` means the horizon could not be computed — either the series does
+    not reach back that far, or its reference bar is a stale/glitched print
+    (see ``fetch.STALE_SERIES_AT``). It renders as an explicit "n/a" rather
+    than a bare dash, so an unavailable reading is never mistaken for a
+    measured one.
+    """
     if value is None:
-        return '<span class="num muted-cell">&mdash;</span>'
+        return '<span class="num muted-cell">n/a</span>'
     arrow = ('<span class="arw">&#9650;</span>' if value > 0 else
              '<span class="arw">&#9660;</span>' if value < 0 else "")
     return (f'<span class="num" style="color:{_move_colour(value)};'
@@ -343,6 +350,15 @@ def _briefing_section(brief):
     </section>"""
 
 
+# Instruments whose "Last" cell overrides the table's default 2 decimals.
+# The VIX is quoted to one decimal in every sentence of the briefing, so the
+# snapshot has to match: showing 18.52 here while the masthead, the desk note
+# and the decision framework all said 18.5 put two different VIX levels on the
+# same page, which is the inconsistency this column used to introduce.
+PRICE_DP = {"^VIX": analysis.VIX_DP}
+DEFAULT_PRICE_DP = 2
+
+
 def _snapshot_section(rows):
     by_class = {}
     for r in rows:
@@ -360,17 +376,18 @@ def _snapshot_section(rows):
         for r in items:
             high = r.get("52w_high") or r.get("high_52w")
             low = r.get("52w_low") or r.get("low_52w")
+            dp = PRICE_DP.get(r["ticker"], DEFAULT_PRICE_DP)
             rows_html.append(
                 "<tr>"
                 f'<td class="name">{html.escape(r["name"])}'
                 f'<span class="ticker">{html.escape(r["ticker"])}</span></td>'
-                f'<td class="price">{_count_price(r.get("price"))}</td>'
+                f'<td class="price">{_count_price(r.get("price"), dp)}</td>'
                 f'<td>{_fmt_pct(r.get("change_pct"))}</td>'
                 f'<td>{_fmt_pct(r.get("week_change_pct"))}</td>'
                 f'<td>{_fmt_pct(r.get("month_change_pct"))}</td>'
                 f'<td>{_fmt_pct(r.get("ytd_change_pct"))}</td>'
-                f'<td class="range">{_fmt_price(low)}&nbsp;&ndash;&nbsp;'
-                f'{_fmt_price(high)}</td>'
+                f'<td class="range">{_fmt_price(low, dp)}&nbsp;&ndash;&nbsp;'
+                f'{_fmt_price(high, dp)}</td>'
                 "</tr>"
             )
         blocks.append(f"""
@@ -1022,14 +1039,14 @@ _SCRIPTS = """
 (function () {
     "use strict";
 
-    // 1. Live clock in the masthead.
+    // 1. Live clock in the masthead. UTC, not the viewer's local time: every
+    //    other timestamp on the page (generation stamp, headline times) is
+    //    UTC, and a clock in local time made those disagree by the reader's
+    //    offset. toISOString() is always UTC, so this needs no tz database.
     function tick() {
         var el = document.getElementById("clock");
         if (!el) return;
-        var now = new Date();
-        el.textContent = now.toLocaleTimeString([], {
-            hour: "2-digit", minute: "2-digit", second: "2-digit"
-        });
+        el.textContent = new Date().toISOString().substr(11, 8) + " UTC";
     }
     tick();
     setInterval(tick, 1000);
@@ -1115,12 +1132,27 @@ def generate_report(rows, headlines=None, reports_dir=REPORTS_DIR):
     from news.fetch_headlines. Returns the written file path.
     """
     os.makedirs(reports_dir, exist_ok=True)
-    now = datetime.now()
+
+    # One clock for the whole page, in UTC and labelled as such. These stamps
+    # used to come from a naive datetime.now() — local wall time printed with
+    # no timezone — while headline stamps were UTC. On a UTC+3 machine that put
+    # "Generated 17:30" next to "14:04 UTC - 25m ago", two readings that cannot
+    # be reconciled by anyone reading the page. Market data is quoted in UTC, so
+    # the page is too, and the news labels below are recomputed against this
+    # same instant.
+    now = datetime.now(timezone.utc)
     long_date = now.strftime("%A, %d %B %Y")
-    stamp = now.strftime("%H:%M")
-    full_stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    stamp = now.strftime("%H:%M UTC")
+    clock_stamp = now.strftime("%H:%M:%S UTC")
+    full_stamp = now.strftime("%Y-%m-%d %H:%M:%S UTC")
     filename = f"market_report_{now.strftime('%Y%m%d')}.html"
     out_path = os.path.join(reports_dir, filename)
+
+    # Headlines: strictly newest-first across sources, with every "X ago" label
+    # recomputed against this render's UTC clock so it agrees with the UTC
+    # stamp printed beside it.
+    headlines = news.refresh_relative_times(
+        news.sort_by_published(headlines or []), now)
 
     # --- Analytics --------------------------------------------------------- #
     vix_value = _find_vix(rows)
@@ -1163,7 +1195,7 @@ def generate_report(rows, headlines=None, reports_dir=REPORTS_DIR):
                 <div class="eyebrow">Market Intelligence &middot; Daily</div>
                 <h1>Morning Market Briefing</h1>
                 <div class="date">{long_date} &middot; {stamp}</div>
-                <div class="clock">Last updated <span id="clock">{stamp}</span></div>
+                <div class="clock">Last updated <span id="clock">{clock_stamp}</span></div>
             </div>
             <div class="mast-right">
                 <div class="eyebrow">Market Regime</div>
@@ -1174,7 +1206,7 @@ def generate_report(rows, headlines=None, reports_dir=REPORTS_DIR):
                     {html.escape(regime['label'])}</div>
                 <div class="mast-vix">VIX Regime
                     <b style="color:{regime_colour}">{regime_label}</b>
-                    &middot; <span class="num">{_fmt_price(vix_value)}</span></div>
+                    &middot; <span class="num">{_fmt_price(vix_value, analysis.VIX_DP)}</span></div>
             </div>
         </div>
     </header>
@@ -1189,7 +1221,7 @@ def generate_report(rows, headlines=None, reports_dir=REPORTS_DIR):
         {_notebook_section(notebook)}
         {_framework_section(framework)}
         {_charts_section(charts)}
-        {_news_section(headlines or [])}
+        {_news_section(headlines)}
 
         <footer class="site-footer">
             <div class="foot-row">

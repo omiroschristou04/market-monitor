@@ -5,6 +5,7 @@ Run with:  python tests/test_analysis.py
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,7 +26,8 @@ def _row(ticker, name, asset_class, price=None, change=None,
 def make_rows(spx=0.28, stoxx=0.45, nikkei=-2.25, ftse=0.33, dax=1.04,
               vix=18.21, tnx_chg=-0.80, tnx=4.604, two_y=4.064,
               eur=-0.06, gbp=-0.50, jpy=0.15, gold=-1.46, crude=0.24,
-              btc=0.20, spx_price=7428.78, spx_high=7609.78, spx_low=6238.01):
+              btc=0.20, spx_price=7428.78, spx_high=7609.78, spx_low=6238.01,
+              vix_chg=-2.46):
     """Full universe with sane defaults = the day the bug was reported."""
     return [
         _row("^GSPC", "S&P 500", "Equity", spx_price, spx, spx_high, spx_low, 8.3),
@@ -33,7 +35,7 @@ def make_rows(spx=0.28, stoxx=0.45, nikkei=-2.25, ftse=0.33, dax=1.04,
         _row("^N225", "Nikkei 225", "Equity", 64931.19, nikkei, 72366.34, 40290.70, 25.3),
         _row("^FTSE", "FTSE 100", "Equity", 10871.02, ftse, 10910.60, 9068.60, 9.2),
         _row("^GDAXI", "DAX", "Equity", 25361.03, dax, 25817.89, 22300.75, 3.3),
-        _row("^VIX", "VIX", "Volatility", vix, -2.46),
+        _row("^VIX", "VIX", "Volatility", vix, vix_chg),
         _row("^TNX", "10Y US Treasury", "Rate", tnx, tnx_chg),
         _row("2YY=F", "2Y US Treasury", "Rate", two_y, 0.10),
         _row("EURUSD=X", "EUR/USD", "FX", 1.1388, eur),
@@ -569,6 +571,196 @@ def test_rates_line():
             check(f"yield check rejects: {text[:44]}", expect in found, str(found))
 
 
+# --------------------------------------------------------------------------- #
+# 11. One VIX rounding, everywhere
+# --------------------------------------------------------------------------- #
+def test_vix_rounding():
+    """The decision framework and the notebook rounded VIX to whole points
+    while every other section printed one decimal, so a single tape read
+    "VIX 18.5" in the masthead and "VIX at 19" three sections further down."""
+    print("\n11. VIX is quoted the same way in every section")
+
+    vix = 18.52
+    rows = make_rows(vix=vix)
+    expected = f"{vix:.1f}"          # 18.5
+    rounded = f"{vix:.0f}"           # 19
+
+    sections = analysis.narrative_sections(rows)
+    quoting = [(src, text) for src, text in sections if "VIX" in text]
+    check("several sections quote the VIX", len(quoting) >= 3, str(len(quoting)))
+
+    # Every VIX level anywhere in the narrative must carry one decimal place.
+    bad = []
+    for src, text in sections:
+        for match in re.finditer(r"VIX\s*(?:at\s*)?(\d+(?:\.\d+)?)", text):
+            number = match.group(1)
+            if number != expected:
+                bad.append(f"{src}: {match.group(0)}")
+    for src, text in quoting:
+        print(f"      {src}: {text[:96]}")
+    check(f"every section quotes VIX as {expected}", not bad, "; ".join(bad))
+    check(f"no section rounds VIX to '{rounded}'",
+          not any(re.search(rf"VIX\s*(?:at\s*)?{rounded}\b", t) for _, t in sections))
+
+    # The framework and the notebook are the two that used to disagree.
+    framework = " ".join(p["text"] for p in analysis.decision_framework(rows))
+    notebook = " ".join(analysis.analyst_notebook(rows))
+    check("decision framework quotes one decimal",
+          expected in framework and f"VIX at {rounded}" not in framework, framework[:120])
+    check("analyst notebook quotes one decimal",
+          expected in notebook and f"VIX {rounded} " not in notebook, notebook[:120])
+
+    # The shared helper is the single source of the format.
+    check("a single helper renders every VIX level",
+          analysis._vix_str(18.52) == "18.5" and analysis.VIX_DP == 1,
+          analysis._vix_str(18.52))
+
+    # Levels that round differently at 0 and 1 dp must still agree everywhere.
+    for level in (12.44, 18.52, 19.49, 24.95, 31.06):
+        texts = [t for _, t in analysis.narrative_sections(make_rows(vix=level))]
+        want = f"{level:.1f}"
+        found = {m for t in texts for m in re.findall(r"VIX\s*(?:at\s*)?(\d+\.?\d*)", t)}
+        check(f"VIX {level} is quoted only as {want}", found == {want}, str(found))
+
+
+# --------------------------------------------------------------------------- #
+# 12. A sharp one-day VIX move is not described as calm
+# --------------------------------------------------------------------------- #
+def test_vix_daily_move():
+    """The volatility copy was selected purely off the level, so a session on
+    which the VIX rose +8.37% into 18.5 still printed "subdued volatility
+    signals a calm, risk-tolerant tape". The level was honest; "calm" was not."""
+    print("\n12. Volatility prose reads the 1-day move, not just the level")
+
+    def vol_of(rows):
+        return next(b["text"] for b in analysis.morning_briefing(rows)["bullets"]
+                    if b["label"] == "Volatility")
+
+    spike = make_rows(vix=18.52, vix_chg=8.37)     # the live report's day
+    calm = make_rows(vix=18.52, vix_chg=-2.46)
+    drift = make_rows(vix=18.52, vix_chg=1.20)
+    collapse = make_rows(vix=18.52, vix_chg=-9.10)
+
+    for label, rows in (("spike +8.37%", spike), ("calm -2.46%", calm),
+                        ("drift +1.20%", drift), ("collapse -9.10%", collapse)):
+        print(f"      {label}: {vol_of(rows)}")
+
+    spike_text = vol_of(spike)
+    check("a +8.37% VIX day is not called calm",
+          "calm" not in spike_text.lower(), spike_text)
+    check("a +8.37% VIX day is not called subdued",
+          "subdued" not in spike_text.lower(), spike_text)
+    check("the spike day says volatility is ticking up from a low base",
+          "ticking up from a low base" in spike_text, spike_text)
+    check("the spike day still acknowledges the low absolute level",
+          "still low" in spike_text, spike_text)
+    check("the spike day quotes the actual 1-day change",
+          "+8.37%" in spike_text, spike_text)
+    check("the spike day is toned caution, not positive",
+          next(b["tone"] for b in analysis.morning_briefing(spike)["bullets"]
+               if b["label"] == "Volatility") == "caution")
+
+    # The regime label reads off the level and must be unaffected.
+    check("VIX regime scoring still reads the level, not the move",
+          analysis._vix_component(18.52) == analysis._vix_component(18.52))
+    check("a quiet day is still called calm", "calm" in vol_of(calm), vol_of(calm))
+    check("a small +1.20% drift is not a spike", "calm" in vol_of(drift), vol_of(drift))
+    check("a sharp fall is not called a spike",
+          "ticking up" not in vol_of(collapse), vol_of(collapse))
+
+    # The threshold behaves at its own boundary.
+    check("just under the threshold reads calm",
+          "calm" in vol_of(make_rows(vix=18.52, vix_chg=4.99)))
+    check("at the threshold reads as ticking up",
+          "ticking up" in vol_of(make_rows(vix=18.52, vix_chg=5.0)))
+
+    # The whole narrative, not just the bullet, must stop saying "calm".
+    brief = analysis.morning_briefing(spike)
+    notebook = " ".join(analysis.analyst_notebook(spike))
+    framework = " ".join(p["text"] for p in analysis.decision_framework(spike))
+    print(f"      paragraph: {brief['paragraph'][:130]}")
+    print(f"      notebook:  {notebook[:130]}")
+    check("the opening paragraph acknowledges the move",
+          "ticking up from a low base" in brief["paragraph"], brief["paragraph"])
+    check("the notebook does not call the spike day calm",
+          "calm but not euphoric" not in notebook, notebook)
+    check("the notebook does not say hedges are still cheap on a spike",
+          "hedges still cheap" not in notebook, notebook)
+    check("the framework does not flatly call options cheap on a spike",
+          "options are cheap" not in framework, framework[:200])
+
+    # Every one of those days must survive the checker.
+    for chg in (-9.10, -5.0, -2.46, 0.0, 1.20, 4.99, 5.0, 8.37, 22.0):
+        rows = make_rows(vix=18.52, vix_chg=chg)
+        res = analysis.consistency_check(rows)
+        for issue in res["issues"]:
+            print(f"        ! VIX {chg:+.2f}%: \"{issue['phrase']}\" vs "
+                  f"{issue['metric']} = {issue['value']}")
+        check(f"VIX {chg:+.2f}% narrative is self-consistent", not res["issues"])
+
+    # And the checker must catch volatility copy that disagrees with the move.
+    spiking = make_rows(vix=18.52, vix_chg=8.37)
+    quiet = make_rows(vix=18.52, vix_chg=-2.46)
+    for rows, text, expect in [
+        (spiking, "Subdued volatility signals a calm, risk-tolerant tape.",
+         "VIX 1-day change"),
+        (spiking, "VIX 18.5 — calm but not euphoric, hedges still cheap",
+         "VIX 1-day change"),
+        (quiet, "Volatility is ticking up from a low base.", "VIX 1-day change"),
+        (spiking, "Volatility is ticking up from a low base.", None),
+        (quiet, "Subdued volatility signals a calm, risk-tolerant tape.", None),
+    ]:
+        res = analysis.consistency_check(rows, sections=[("planted", text)])
+        found = {i["metric"] for i in res["issues"]}
+        if expect is None:
+            check(f"vol check allows: {text[:46]}", not res["issues"], str(found))
+        else:
+            check(f"vol check rejects: {text[:46]}", expect in found, str(found))
+
+
+# --------------------------------------------------------------------------- #
+# 13. The 52-week-high sentence says which level sits above which
+# --------------------------------------------------------------------------- #
+def test_high_vs_spot_wording():
+    """"2.4% above spot at 7,429" let the percentage attach to either number,
+    so the sentence could be read as the high being 2.4% above 7,429 or as
+    7,429 itself being 2.4% above something."""
+    print("\n13. 52-week-high wording is unambiguous")
+
+    rows = make_rows(spx_price=7428.78, spx_high=7609.78)
+    watch = next(b["text"] for b in analysis.morning_briefing(rows)["bullets"]
+                 if b["label"] == "Watch today")
+    print(f"      {watch}")
+
+    check("the ambiguous 'above spot' phrasing is gone",
+          "above spot" not in watch, watch)
+    check("the high is named as the high",
+          "52-week high of 7,610" in watch, watch)
+    check("the price is named as the current price",
+          "current price of 7,429" in watch, watch)
+    check("the sentence states the relationship explicitly",
+          "sits 2.4% above the current price" in watch, watch)
+    check("both numbers still appear",
+          "7,610" in watch and "7,429" in watch, watch)
+
+    # The other places that quote both levels were already unambiguous and
+    # must stay that way.
+    notebook = " ".join(analysis.analyst_notebook(rows))
+    framework = " ".join(p["text"] for p in analysis.decision_framework(rows))
+    paragraph = analysis.morning_briefing(rows)["paragraph"]
+    for name, text in (("notebook", notebook), ("framework", framework),
+                       ("paragraph", paragraph)):
+        check(f"{name} never says 'above spot'", "above spot" not in text, text[:140])
+    check("the paragraph still labels both numbers",
+          "trades at 7,429" in paragraph and "52-week closing high of 7,610" in paragraph,
+          paragraph[:160])
+
+    # The whole day still passes the checker with the new wording.
+    res = analysis.consistency_check(rows)
+    check("rewording did not break narrative consistency", not res["issues"],
+          str([i["phrase"] for i in res["issues"]]))
+
+
 def main():
     print("=" * 70)
     print(" ANALYSIS TESTS — regime classifier + narrative consistency")
@@ -583,6 +775,9 @@ def main():
     test_missing_data()
     test_neutral_components_never_lean()
     test_rates_line()
+    test_vix_rounding()
+    test_vix_daily_move()
+    test_high_vs_spot_wording()
 
     print("\n" + "=" * 70)
     print(f" {len(PASSED)} passed, {len(FAILED)} failed")

@@ -54,6 +54,9 @@ FEEDS = [
 MAX_PER_SOURCE = 5
 MAX_AGE_HOURS = 24
 
+# Sort fallback for an item whose publish time could not be parsed.
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 # A realistic desktop-browser user agent — some feeds and article pages reject
 # the default feedparser/requests agent.
 USER_AGENT = (
@@ -368,7 +371,13 @@ def attach_images(headlines, max_workers=8):
 
 
 def _relative_time(dt, now):
-    """Human-friendly 'time ago' string, e.g. '3h ago' / '12m ago'."""
+    """Human-friendly 'time ago' string, e.g. '3h ago' / '12m ago'.
+
+    Both arguments must be timezone-aware UTC datetimes. Everything upstream
+    keeps publish times in UTC (see :func:`_entry_time`), and the report prints
+    its own timestamps in UTC, so the label and the ``HH:MM UTC`` stamp beside
+    it always describe the same clock.
+    """
     delta = now - dt
     minutes = int(delta.total_seconds() // 60)
     if minutes < 1:
@@ -379,6 +388,48 @@ def _relative_time(dt, now):
     if hours < 24:
         return f"{hours}h ago"
     return f"{hours // 24}d ago"
+
+
+def _as_utc(value):
+    """Coerce a datetime to timezone-aware UTC, or return None."""
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def sort_by_published(headlines):
+    """Return *headlines* strictly newest-first across every source.
+
+    Sorting has to span sources, not run inside each one: the feeds are fetched
+    and capped one at a time, so without a merge every Reuters item preceded
+    every BBC item no matter when each was published — a 13:27 story sat below
+    a 12:57 one purely because of which feed it came from. Items with no usable
+    publish time sort last rather than being dropped.
+    """
+    return sorted(headlines,
+                  key=lambda h: _as_utc(h.get("published")) or _EPOCH,
+                  reverse=True)
+
+
+def refresh_relative_times(headlines, now=None):
+    """Recompute every 'X ago' label against *now*, in UTC. Returns *headlines*.
+
+    ``relative`` is stamped when a feed is fetched, but the report renders
+    afterwards, so the label has to be refreshed against the same UTC clock the
+    page prints in its masthead and footer — otherwise a story shows "25m ago"
+    next to a generation time it cannot be reconciled with. ``published_str``
+    is rewritten from the same instant, so the stamp and the label can never
+    disagree. Items with no parsed publish time are left untouched.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    for h in headlines:
+        published = _as_utc(h.get("published"))
+        if published is None:
+            continue
+        h["relative"] = _relative_time(published, now)
+        h["published_str"] = published.strftime("%H:%M UTC")
+    return headlines
 
 
 def fetch_feed(feed, now=None):
@@ -408,9 +459,11 @@ def fetch_feed(feed, now=None):
             "relative": _relative_time(published, now),
         })
 
-    # Newest first, then cap per source. Redirects are resolved *after* the
-    # cap so we only pay the round-trips for items that reach the report.
-    headlines.sort(key=lambda h: h["published"], reverse=True)
+    # Newest first, then cap per source, so the cap keeps this feed's freshest
+    # items. The cross-source ordering is applied later, in fetch_headlines.
+    # Redirects are resolved *after* the cap so we only pay the round-trips for
+    # items that reach the report.
+    headlines = sort_by_published(headlines)
     return resolve_links(headlines[:MAX_PER_SOURCE])
 
 
@@ -436,4 +489,14 @@ def fetch_headlines(now=None):
     attach_images(all_headlines)
     with_images = sum(1 for h in all_headlines if h.get("image"))
     print(f"  - Thumbnails    {with_images}/{len(all_headlines)} image(s) found")
+
+    # Merge the per-source lists into one strictly newest-first run. Each feed
+    # was only ever sorted within itself, so this is what stops the report
+    # showing a 12:57 Reuters item above a 13:27 BBC one.
+    all_headlines = sort_by_published(all_headlines)
+    if all_headlines:
+        newest = all_headlines[0].get("published_str", "")
+        oldest = all_headlines[-1].get("published_str", "")
+        print(f"  - Ordering      {len(all_headlines)} item(s) newest-first "
+              f"across sources ({newest} -> {oldest})")
     return all_headlines
